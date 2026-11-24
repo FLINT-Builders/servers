@@ -160,7 +160,8 @@ src/everything
   - Environment controls:
     - `GZIP_MAX_FETCH_SIZE` (bytes, default 10 MiB)
     - `GZIP_MAX_FETCH_TIME_MILLIS` (ms, default 30000)
-    - `GZIP_ALLOWED_DOMAINS` (comma-separated allowlist; empty means all domains allowed)
+    - `GZIP_ALLOWED_DOMAINS` (comma-separated allowlist; unset or empty allows only `raw.githubusercontent.com`, the host of the default URL)
+  - Hosts are resolved once and the request is sent to that address. Loopback, private, link-local (including cloud metadata), and other non-public addresses are always refused, even for allowlisted hosts. Redirects are followed manually (up to 5) and each hop is checked the same way.
 - `simulate-research-query.ts`
   - Registers a `simulate-research-query` task-based tool that demonstrates the MCP Tasks feature (SEP-1686). Simulates a multi-stage research operation with progress updates. If the query is marked as ambiguous and the client supports elicitation, it pauses mid-execution to request clarification via `elicitation/create`. Uses `server.experimental.tasks.registerToolTask()` with `execution: { taskSupport: "required" }`.
 - `trigger-elicitation-request.ts`
