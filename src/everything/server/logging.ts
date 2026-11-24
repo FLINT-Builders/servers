@@ -64,6 +64,15 @@ export const beginSimulatedLogging = (
 };
 
 /**
+ * Reports whether simulated logging is active for a given session.
+ *
+ * @param {string} [sessionId] - The optional unique identifier of the session.
+ * @returns {boolean}
+ */
+export const isSimulatingLogging = (sessionId?: string): boolean =>
+  logsUpdateIntervals.has(sessionId);
+
+/**
  * Stops the simulated logging process for a given session.
  *
  * This function halts the periodic logging updates associated with the specified

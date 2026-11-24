@@ -88,3 +88,12 @@ export const syncRoots = async (server: McpServer, sessionId?: string) => {
     return roots.get(sessionId);
   }
 };
+
+/**
+ * Removes the cached roots list for a session that has ended.
+ *
+ * @param {string} [sessionId] - The session whose roots should be released.
+ */
+export const clearRoots = (sessionId?: string) => {
+  roots.delete(sessionId);
+};

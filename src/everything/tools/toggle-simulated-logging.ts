@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   beginSimulatedLogging,
+  isSimulatingLogging,
   stopSimulatedLogging,
 } from "../server/logging.js";
 
@@ -18,9 +19,6 @@ const config = {
     openWorldHint: false,
   },
 };
-
-// Track enabled clients by session id
-const clients: Set<string | undefined> = new Set<string | undefined>();
 
 /**
  * Registers the `toggle-simulated-logging` tool.
@@ -42,13 +40,11 @@ export const registerToggleSimulatedLoggingTool = (server: McpServer) => {
       const sessionId = extra?.sessionId;
 
       let response: string;
-      if (clients.has(sessionId)) {
+      if (isSimulatingLogging(sessionId)) {
         stopSimulatedLogging(sessionId);
-        clients.delete(sessionId);
         response = `Stopped simulated logging for session ${sessionId}`;
       } else {
         beginSimulatedLogging(server, sessionId);
-        clients.add(sessionId);
         response = `Started simulated, random-leveled logging for session ${sessionId} at a 5 second pace. Client's selected logging level will be respected. If an interval elapses and the message to be sent is below the selected level, it will not be sent. Thus at higher chosen logging levels, messages should arrive further apart. `;
       }
 
