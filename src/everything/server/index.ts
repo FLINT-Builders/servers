@@ -8,6 +8,7 @@ import {
   stopSimulatedResourceUpdates,
 } from "../resources/subscriptions.js";
 import { registerConditionalTools, registerTools } from "../tools/index.js";
+import { clearIssuedErrorPathElicitations } from "../tools/trigger-url-elicitation.js";
 import { registerResources, readInstructions } from "../resources/index.js";
 import { registerPrompts } from "../prompts/index.js";
 import { stopSimulatedLogging } from "./logging.js";
@@ -110,6 +111,7 @@ export const createServer: () => ServerFactoryResponse = () => {
       // Stop any simulated logging or resource updates that may have been initiated.
       stopSimulatedLogging(sessionId);
       stopSimulatedResourceUpdates(sessionId);
+      clearIssuedErrorPathElicitations(sessionId);
       // Clean up task store timers
       taskStore.cleanup();
       if (initializeTimeout) clearTimeout(initializeTimeout);
