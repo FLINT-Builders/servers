@@ -6,12 +6,25 @@ import {
   Task,
   ElicitResult,
   ElicitResultSchema,
+  ErrorCode,
+  McpError,
 } from "@modelcontextprotocol/sdk/types.js";
-import { CreateTaskResult } from "@modelcontextprotocol/sdk/experimental/tasks";
+import {
+  CreateTaskResult,
+  isTerminal,
+} from "@modelcontextprotocol/sdk/experimental/tasks";
+import { RequestTaskStore } from "@modelcontextprotocol/sdk/shared/protocol.js";
+
+// Bounds on caller-controlled state held by a single session
+const MAX_TOPIC_LENGTH = 8192;
+const MAX_INFLIGHT_TASKS = 8;
 
 // Tool input schema
 const SimulateResearchQuerySchema = z.object({
-  topic: z.string().describe("The research topic to investigate"),
+  topic: z
+    .string()
+    .max(MAX_TOPIC_LENGTH)
+    .describe("The research topic to investigate"),
   ambiguous: z
     .boolean()
     .default(false)
@@ -37,12 +50,56 @@ interface ResearchState {
   ambiguous: boolean;
   currentStage: number;
   clarification?: string;
-  completed: boolean;
-  result?: CallToolResult;
+  abortController: AbortController;
 }
 
-// Map to store research state per task
-const researchStates = new Map<string, ResearchState>();
+// In-flight research tasks, scoped to the server (one per session) that created them.
+// Entries live only while the background process runs; results are held by the task store.
+const researchTasksByServer = new WeakMap<McpServer, Set<ResearchState>>();
+
+/**
+ * Stops every in-flight research task created through the given server and releases
+ * its state. Called from the server's session cleanup.
+ *
+ * @param {McpServer} server - The server whose research tasks should be stopped.
+ */
+export const stopResearchTasks = (server: McpServer) => {
+  const tasks = researchTasksByServer.get(server);
+  if (!tasks) return;
+  for (const state of tasks) {
+    state.abortController.abort();
+  }
+  tasks.clear();
+};
+
+/**
+ * Resolves after `ms` milliseconds, or immediately once `signal` aborts.
+ */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Returns true once the task has reached a terminal status (e.g. cancelled by the client).
+ */
+async function isTaskFinished(
+  taskStore: RequestTaskStore,
+  taskId: string
+): Promise<boolean> {
+  const task: Task | undefined = await taskStore.getTask(taskId);
+  return !!task && isTerminal(task.status);
+}
 
 /**
  * Runs the background research process.
@@ -54,31 +111,19 @@ const researchStates = new Map<string, ResearchState>();
  */
 async function runResearchProcess(
   taskId: string,
-  args: z.infer<typeof SimulateResearchQuerySchema>,
-  taskStore: {
-    updateTaskStatus: (
-      taskId: string,
-      status: Task["status"],
-      message?: string
-    ) => Promise<void>;
-    storeTaskResult: (
-      taskId: string,
-      status: "completed" | "failed",
-      result: CallToolResult
-    ) => Promise<void>;
-  },
+  state: ResearchState,
+  taskStore: RequestTaskStore,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sendRequest: any
 ): Promise<void> {
-  const state = researchStates.get(taskId);
-  if (!state) return;
+  const { signal } = state.abortController;
 
   // Process each stage
   for (let i = state.currentStage; i < STAGES.length; i++) {
     state.currentStage = i;
 
-    // Check if task was cancelled externally
-    if (state.completed) return;
+    // Stop if the session ended or the client cancelled the task
+    if (signal.aborted || (await isTaskFinished(taskStore, taskId))) return;
 
     // Update status message for current stage
     await taskStore.updateTaskStatus(taskId, "working", `${STAGES[i]}...`);
@@ -115,7 +160,7 @@ async function runResearchProcess(
             },
           },
           ElicitResultSchema,
-          { relatedTask: { taskId } }
+          { relatedTask: { taskId }, signal }
         );
 
         // Process elicitation response
@@ -129,6 +174,7 @@ async function runResearchProcess(
           state.clarification = "User cancelled - using default interpretation";
         }
       } catch (error) {
+        if (signal.aborted) return;
         // Elicitation failed - use default interpretation and continue
         console.warn(
           `Elicitation failed for task ${taskId}:`,
@@ -148,15 +194,17 @@ async function runResearchProcess(
     }
 
     // Simulate work for this stage
-    await new Promise((resolve) => setTimeout(resolve, STAGE_DURATION));
+    await sleep(STAGE_DURATION, signal);
   }
 
-  // All stages complete - generate result
-  state.completed = true;
-  const result = generateResearchReport(state);
-  state.result = result;
+  if (signal.aborted || (await isTaskFinished(taskStore, taskId))) return;
 
-  await taskStore.storeTaskResult(taskId, "completed", result);
+  // All stages complete - generate result
+  await taskStore.storeTaskResult(
+    taskId,
+    "completed",
+    generateResearchReport(state)
+  );
 }
 
 /**
@@ -239,6 +287,10 @@ export const registerSimulateResearchQueryTool = (server: McpServer) => {
   const clientSupportsElicitation: boolean =
     clientCapabilities.elicitation !== undefined;
 
+  const inflightTasks =
+    researchTasksByServer.get(server) ?? new Set<ResearchState>();
+  researchTasksByServer.set(server, inflightTasks);
+
   server.experimental.tasks.registerToolTask(
     "simulate-research-query",
     {
@@ -263,34 +315,46 @@ export const registerSimulateResearchQueryTool = (server: McpServer) => {
       createTask: async (args, extra): Promise<CreateTaskResult> => {
         const validatedArgs = SimulateResearchQuerySchema.parse(args);
 
-        // Create the task in the store
-        const task = await extra.taskStore.createTask({
-          ttl: 300000, // 5 minutes
-          pollInterval: 1000,
-        });
-
-        // Initialize research state
+        // The slot must be reserved before the first await so concurrent calls cannot exceed the cap
+        if (inflightTasks.size >= MAX_INFLIGHT_TASKS) {
+          throw new McpError(
+            ErrorCode.InvalidRequest,
+            `Too many research tasks in progress (maximum ${MAX_INFLIGHT_TASKS} per session). Wait for one to finish or cancel it.`
+          );
+        }
         const state: ResearchState = {
           topic: validatedArgs.topic,
           ambiguous: validatedArgs.ambiguous && clientSupportsElicitation,
           currentStage: 0,
-          completed: false,
+          abortController: new AbortController(),
         };
-        researchStates.set(task.taskId, state);
+        inflightTasks.add(state);
+
+        let task;
+        try {
+          task = await extra.taskStore.createTask({
+            ttl: 300000, // 5 minutes
+            pollInterval: 1000,
+          });
+        } catch (error) {
+          inflightTasks.delete(state);
+          throw error;
+        }
+        const { taskId } = task;
 
         // Start background research (don't await - runs asynchronously)
         // Pass sendRequest for elicitation (queued via task message queue, works on all transports)
-        runResearchProcess(
-          task.taskId,
-          validatedArgs,
-          extra.taskStore,
-          extra.sendRequest
-        ).catch((error) => {
-          console.error(`Research task ${task.taskId} failed:`, error);
-          extra.taskStore
-            .updateTaskStatus(task.taskId, "failed", String(error))
-            .catch(console.error);
-        });
+        runResearchProcess(taskId, state, extra.taskStore, extra.sendRequest)
+          .catch(async (error) => {
+            if (state.abortController.signal.aborted) return;
+            console.error(`Research task ${taskId} failed:`, error);
+            await extra.taskStore
+              .updateTaskStatus(taskId, "failed", String(error))
+              .catch(console.error);
+          })
+          .finally(() => {
+            inflightTasks.delete(state);
+          });
 
         return { task };
       },
@@ -307,13 +371,9 @@ export const registerSimulateResearchQueryTool = (server: McpServer) => {
        * Elicitation is now handled directly in the background process.
        */
       getTaskResult: async (args, extra): Promise<CallToolResult> => {
-        // Return the stored result
-        const result = await extra.taskStore.getTaskResult(extra.taskId);
-
-        // Clean up state
-        researchStates.delete(extra.taskId);
-
-        return result as CallToolResult;
+        return (await extra.taskStore.getTaskResult(
+          extra.taskId
+        )) as CallToolResult;
       },
     }
   );
