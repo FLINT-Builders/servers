@@ -5,7 +5,7 @@ import { randomBytes } from 'crypto';
 import { StringDecoder } from 'string_decoder';
 import { diffLines, createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
-import { normalizePath, expandHome } from './path-utils.js';
+import { normalizePathFormat, expandHome } from './path-utils.js';
 import { isPathWithinAllowedDirectories } from './path-validation.js';
 
 // Global allowed directories - set by the main module
@@ -83,7 +83,7 @@ function resolveRelativePathAgainstAllowedDirectories(relativePath: string): str
   // Try to resolve relative path against each allowed directory
   for (const allowedDir of allowedDirectories) {
     const candidate = path.resolve(allowedDir, relativePath);
-    const normalizedCandidate = normalizePath(candidate);
+    const normalizedCandidate = normalizePathFormat(candidate);
     
     // Check if the resulting path lies within any allowed directory
     if (isPathWithinAllowedDirectories(normalizedCandidate, allowedDirectories)) {
@@ -100,14 +100,19 @@ function resolveRelativePathAgainstAllowedDirectories(relativePath: string): str
 async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<string> {
   const allowedDirectory = [...allowedDirectories]
     .sort((left, right) => right.length - left.length)
-    .find(directory => isPathWithinAllowedDirectories(normalizePath(absolutePath), [directory]));
+    .find(directory => isPathWithinAllowedDirectories(normalizePathFormat(absolutePath), [directory]));
 
   if (!allowedDirectory) {
-    return absolutePath;
+    throw new Error(`Access denied - path outside allowed directories: ${absolutePath} not in ${allowedDirectories.join(', ')}`);
+  }
+
+  const relativePath = path.relative(allowedDirectory, absolutePath);
+  const relativeParts = relativePath.split(path.sep).filter(Boolean);
+  if (path.isAbsolute(relativePath) || relativeParts.includes('..')) {
+    throw new Error(`Access denied - path outside allowed directories: ${absolutePath} not in ${allowedDirectories.join(', ')}`);
   }
 
   let currentPath = await fs.realpath(allowedDirectory);
-  const relativeParts = path.relative(allowedDirectory, absolutePath).split(path.sep).filter(Boolean);
 
   for (let index = 0; index < relativeParts.length; index++) {
     const requestedPart = relativeParts[index];
@@ -129,7 +134,7 @@ async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<strin
     }
 
     currentPath = await fs.realpath(path.join(currentPath, equivalentMatches[0]));
-    if (!isPathWithinAllowedDirectories(normalizePath(currentPath), allowedDirectories)) {
+    if (!isPathWithinAllowedDirectories(normalizePathFormat(currentPath), allowedDirectories)) {
       throw new Error(`Access denied - symlink target outside allowed directories: ${currentPath} not in ${allowedDirectories.join(', ')}`);
     }
   }
@@ -149,7 +154,9 @@ export async function validatePath(requestedPath: string): Promise<string> {
     ? path.resolve(expandedPath)
     : resolveRelativePathAgainstAllowedDirectories(expandedPath);
 
-  const normalizedRequested = normalizePath(absolute);
+  // Security: Check the exact path the filesystem calls use. normalizePath
+  // strips quotes and whitespace, so `<allowed>'` would pass as `<allowed>`.
+  const normalizedRequested = normalizePathFormat(absolute);
 
   // Security: Check if path is within allowed directories before any file operations
   const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, allowedDirectories);
@@ -161,7 +168,7 @@ export async function validatePath(requestedPath: string): Promise<string> {
   // This prevents attackers from creating symlinks that point outside allowed directories
   try {
     const realPath = await fs.realpath(absolute);
-    const normalizedReal = normalizePath(realPath);
+    const normalizedReal = normalizePathFormat(realPath);
     if (!isPathWithinAllowedDirectories(normalizedReal, allowedDirectories)) {
       throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(', ')}`);
     }
