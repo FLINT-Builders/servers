@@ -20,6 +20,11 @@ from pydantic import BaseModel, Field
 # Default number of context lines to show in diff output
 DEFAULT_CONTEXT_LINES = 3
 
+# Git LFS takes its endpoint from the checked-out revision's .lfsconfig, so an
+# LFS download would request a URL chosen by whoever wrote that revision.
+# Smudge filters must leave LFS pointer files as they are.
+GIT_LFS_SKIP_SMUDGE_ENV = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
 class GitStatus(BaseModel):
     repo_path: str
 
@@ -200,7 +205,7 @@ def git_checkout(repo: git.Repo, branch_name: str) -> str:
     if branch_name.startswith("-"):
         raise BadName(f"Invalid branch name: '{branch_name}' - cannot start with '-'")
     repo.rev_parse(branch_name)  # Validates branch_name is a real git ref, throws BadName if not
-    repo.git.checkout(branch_name)
+    repo.git.checkout(branch_name, env=GIT_LFS_SKIP_SMUDGE_ENV)
     return f"Switched to branch '{branch_name}'"
 
 
@@ -476,6 +481,7 @@ async def serve(repository: Path | None) -> None:
 
         # For all commands, we need an existing repo
         repo = git.Repo(repo_path)
+        repo.git.update_environment(**GIT_LFS_SKIP_SMUDGE_ENV)
 
         match name:
             case GitTools.STATUS:
