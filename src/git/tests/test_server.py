@@ -283,8 +283,10 @@ def test_git_show_initial_commit(test_repository):
 # Tests for validate_repo_path (repository scoping security fix)
 
 def test_validate_repo_path_no_restriction():
-    """When no repository restriction is configured, any path should be allowed."""
-    validate_repo_path(Path("/any/path"), None)  # Should not raise
+    """When no repository restriction is configured, every path should be rejected."""
+    with pytest.raises(ValueError) as exc_info:
+        validate_repo_path(Path("/any/path"), None)
+    assert "--repository" in str(exc_info.value)
 
 
 def test_validate_repo_path_exact_match(tmp_path: Path):

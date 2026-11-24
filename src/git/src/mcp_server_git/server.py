@@ -1,4 +1,6 @@
 import logging
+import os
+import stat
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from mcp.server import Server
@@ -232,10 +234,17 @@ def git_show(repo: git.Repo, revision: str) -> str:
             output.append(d.diff)
     return "".join(output)
 
-def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None:
-    """Validate that repo_path is within the allowed repository path."""
+def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> Path:
+    """Validate that repo_path is within the allowed repository path.
+
+    Returns the resolved path that passed the check. Callers must act on that
+    path, not on repo_path, which may resolve elsewhere on a later lookup.
+    """
     if allowed_repository is None:
-        return  # No restriction configured
+        raise ValueError(
+            "No repository is configured. Start mcp-server-git with "
+            "--repository <path> to allow access to a repository."
+        )
 
     # Resolve both paths to handle symlinks and relative paths
     try:
@@ -251,6 +260,73 @@ def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None
         raise ValueError(
             f"Repository path '{repo_path}' is outside the allowed repository '{allowed_repository}'"
         )
+    return resolved_repo
+
+
+def _stat_directory_nofollow(path: Path) -> os.stat_result:
+    """Stat the directory at path, refusing if any path component is a symlink.
+
+    Where the platform supports it, each component is opened relative to the
+    descriptor of its parent so a component cannot be swapped for a symlink
+    between the per-component checks.
+    """
+    flags = getattr(os, "O_PATH", os.O_RDONLY)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is not None and directory is not None and os.open in os.supports_dir_fd:
+        flags |= nofollow | directory
+        fd = os.open(path.anchor, flags)
+        try:
+            for part in path.parts[1:]:
+                next_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            return os.fstat(fd)
+        finally:
+            os.close(fd)
+
+    for component in [*reversed(path.parents), path]:
+        is_junction = getattr(component, "is_junction", None)
+        if component.is_symlink() or (is_junction is not None and is_junction()):
+            raise OSError(f"Path component is a link: {component}")
+    result = os.lstat(path)
+    if not stat.S_ISDIR(result.st_mode):
+        raise NotADirectoryError(str(path))
+    return result
+
+
+def open_repo(repo_path: Path, allowed_repository: Path | None) -> git.Repo:
+    """Open the repository at the path that passed validate_repo_path.
+
+    The identity of the checked directory is recorded before the repository is
+    opened and compared afterwards, so a path that is retargeted in between is
+    refused rather than followed.
+    """
+    resolved_repo = validate_repo_path(repo_path, allowed_repository)
+    try:
+        authorized = _stat_directory_nofollow(resolved_repo)
+    except OSError:
+        raise ValueError(f"Invalid path: {repo_path}")
+
+    # A str (unlike a Path) is only normalized by GitPython, not resolved again,
+    # so the repository is opened at the checked location.
+    repo = git.Repo(str(resolved_repo), expand_vars=False)
+    try:
+        opened = _stat_directory_nofollow(resolved_repo)
+    except OSError:
+        opened = None
+    if opened is None or not os.path.samestat(authorized, opened):
+        repo.close()
+        raise ValueError(f"Repository path '{repo_path}' changed while it was being opened")
+
+    # GitPython runs git commands from an environment-variable-expanded copy of
+    # the working directory, which for a path containing e.g. '$NAME' is not the
+    # directory that was checked.
+    command_dir = repo.git.working_dir
+    if command_dir is None or os.path.normpath(command_dir) != os.path.normpath(repo.working_dir):
+        repo.close()
+        raise ValueError(f"Repository path '{repo_path}' is not supported")
+    return repo
 
 
 def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, not_contains: str | None = None) -> str:
@@ -298,6 +374,10 @@ async def serve(repository: Path | None) -> None:
         except git.InvalidGitRepositoryError:
             logger.error(f"{repository} is not a valid Git repository")
             return
+    else:
+        logger.warning(
+            "No --repository configured; every tool call will be rejected"
+        )
 
     server = Server("mcp-git")
 
@@ -471,11 +551,9 @@ async def serve(repository: Path | None) -> None:
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         repo_path = Path(arguments["repo_path"])
 
-        # Validate repo_path is within allowed repository
-        validate_repo_path(repo_path, repository)
-
-        # For all commands, we need an existing repo
-        repo = git.Repo(repo_path)
+        # Validate repo_path is within allowed repository and open the
+        # repository at the path that was checked
+        repo = open_repo(repo_path, repository)
 
         match name:
             case GitTools.STATUS:
