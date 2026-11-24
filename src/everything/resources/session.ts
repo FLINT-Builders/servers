@@ -5,8 +5,22 @@ import { Resource, ResourceLink } from "@modelcontextprotocol/sdk/types.js";
  * Tracks registered session resources by URI to allow updating/removing on re-registration.
  * This prevents "Resource already registered" errors when a tool creates a resource
  * with the same URI multiple times during a session.
+ *
+ * Each server instance (one per session) gets its own registry, so a session can only
+ * replace or remove resources it registered itself.
  */
-const registeredResources = new Map<string, RegisteredResource>();
+const sessionRegistries = new WeakMap<McpServer, Map<string, RegisteredResource>>();
+
+const getSessionRegistry = (
+  server: McpServer
+): Map<string, RegisteredResource> => {
+  let registry = sessionRegistries.get(server);
+  if (!registry) {
+    registry = new Map<string, RegisteredResource>();
+    sessionRegistries.set(server, registry);
+  }
+  return registry;
+};
 
 /**
  * Generates a session-scoped resource URI string based on the provided resource name.
@@ -54,11 +68,13 @@ export const registerSessionResource = (
           blob: payload,
         };
 
-  // Check if a resource with this URI is already registered and remove it
-  const existingResource = registeredResources.get(uri);
+  const registry = getSessionRegistry(server);
+
+  // Check if this session already registered a resource with this URI and remove it
+  const existingResource = registry.get(uri);
   if (existingResource) {
     existingResource.remove();
-    registeredResources.delete(uri);
+    registry.delete(uri);
   }
 
   // Register file resource
@@ -74,7 +90,21 @@ export const registerSessionResource = (
   );
 
   // Track the registered resource for potential future removal
-  registeredResources.set(uri, registeredResource);
+  registry.set(uri, registeredResource);
 
   return { type: "resource_link", ...resource };
+};
+
+/**
+ * Removes all session resources registered with the given server and drops its registry.
+ *
+ * @param {McpServer} server - The server instance whose session is ending.
+ */
+export const clearSessionResources = (server: McpServer): void => {
+  const registry = sessionRegistries.get(server);
+  if (!registry) return;
+  sessionRegistries.delete(server);
+  for (const registeredResource of registry.values()) {
+    registeredResource.remove();
+  }
 };
