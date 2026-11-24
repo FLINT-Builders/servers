@@ -44,6 +44,15 @@ function createMockFileHandle(content: Buffer) {
   };
 }
 
+function createMockTempHandle(gid: number = 1000) {
+  return {
+    stat: vi.fn().mockResolvedValue({ uid: 1000, gid }),
+    chown: vi.fn().mockResolvedValue(undefined),
+    chmod: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 describe('Lib Functions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -352,30 +361,84 @@ describe('Lib Functions', () => {
       });
 
       it('preserves file permissions when overwriting existing file', async () => {
+        const tempHandle = createMockTempHandle();
         // First writeFile call with 'wx' flag fails because file exists
         mockFs.writeFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST'), { code: 'EEXIST' }));
         // stat returns executable permissions
-        mockFs.stat.mockResolvedValueOnce({ mode: 0o100755 });
+        mockFs.stat.mockResolvedValueOnce({ mode: 0o100755, gid: 1000 });
+        mockFs.open.mockResolvedValueOnce(tempHandle);
         // Second writeFile (to temp) succeeds
         mockFs.writeFile.mockResolvedValueOnce(undefined);
         mockFs.rename.mockResolvedValueOnce(undefined);
-        mockFs.chmod.mockResolvedValueOnce(undefined);
 
         await writeFileContent('/test/script.sh', 'new content');
 
         expect(mockFs.stat).toHaveBeenCalledWith('/test/script.sh');
-        expect(mockFs.chmod).toHaveBeenCalledWith('/test/script.sh', 0o755);
+        expect(mockFs.open).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/script\.sh\.[a-f0-9]+\.tmp$/),
+          'wx',
+          0o600
+        );
+        expect(mockFs.writeFile).toHaveBeenLastCalledWith(tempHandle, 'new content', 'utf-8');
+        expect(tempHandle.chown).not.toHaveBeenCalled();
+        expect(tempHandle.chmod).toHaveBeenCalledWith(0o755);
+        expect(mockFs.chmod).not.toHaveBeenCalled();
+        expect(mockFs.rename).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/script\.sh\.[a-f0-9]+\.tmp$/),
+          '/test/script.sh'
+        );
+        expect(tempHandle.chmod.mock.invocationCallOrder[0])
+          .toBeLessThan(mockFs.rename.mock.invocationCallOrder[0]);
       });
 
-      it('does not fail the write when chmod fails', async () => {
+      it('creates the temp file no more permissive than a stricter original mode', async () => {
+        const tempHandle = createMockTempHandle();
         mockFs.writeFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST'), { code: 'EEXIST' }));
-        mockFs.stat.mockResolvedValueOnce({ mode: 0o100755 });
+        mockFs.stat.mockResolvedValueOnce({ mode: 0o100400, gid: 1000 });
+        mockFs.open.mockResolvedValueOnce(tempHandle);
         mockFs.writeFile.mockResolvedValueOnce(undefined);
         mockFs.rename.mockResolvedValueOnce(undefined);
-        mockFs.chmod.mockRejectedValueOnce(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
 
-        await expect(writeFileContent('/test/script.sh', 'new content')).resolves.toBeUndefined();
-        expect(mockFs.unlink).not.toHaveBeenCalled();
+        await writeFileContent('/test/key.pem', 'new content');
+
+        expect(mockFs.open).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/key\.pem\.[a-f0-9]+\.tmp$/),
+          'wx',
+          0o400
+        );
+        expect(tempHandle.chmod).toHaveBeenCalledWith(0o400);
+      });
+
+      it('fails the write and removes the temp file when chmod fails', async () => {
+        const tempHandle = createMockTempHandle();
+        tempHandle.chmod.mockRejectedValueOnce(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
+        mockFs.writeFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST'), { code: 'EEXIST' }));
+        mockFs.stat.mockResolvedValueOnce({ mode: 0o100755, gid: 1000 });
+        mockFs.open.mockResolvedValueOnce(tempHandle);
+        mockFs.writeFile.mockResolvedValueOnce(undefined);
+        mockFs.unlink.mockResolvedValueOnce(undefined);
+
+        await expect(writeFileContent('/test/script.sh', 'new content')).rejects.toThrow('EPERM');
+        expect(tempHandle.close).toHaveBeenCalled();
+        expect(mockFs.rename).not.toHaveBeenCalled();
+        expect(mockFs.unlink).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/script\.sh\.[a-f0-9]+\.tmp$/)
+        );
+      });
+
+      it('drops group permission bits when the original group cannot be restored', async () => {
+        const tempHandle = createMockTempHandle(1000);
+        tempHandle.chown.mockRejectedValueOnce(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
+        mockFs.writeFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST'), { code: 'EEXIST' }));
+        mockFs.stat.mockResolvedValueOnce({ mode: 0o100640, gid: 2000 });
+        mockFs.open.mockResolvedValueOnce(tempHandle);
+        mockFs.writeFile.mockResolvedValueOnce(undefined);
+        mockFs.rename.mockResolvedValueOnce(undefined);
+
+        await writeFileContent('/test/shared.txt', 'new content');
+
+        expect(tempHandle.chown).toHaveBeenCalledWith(1000, 2000);
+        expect(tempHandle.chmod).toHaveBeenCalledWith(0o600);
       });
     });
 
@@ -505,11 +568,14 @@ describe('Lib Functions', () => {
 
   describe('File Editing Functions', () => {
     describe('applyFileEdits', () => {
+      let tempHandle: ReturnType<typeof createMockTempHandle>;
+
       beforeEach(() => {
+        tempHandle = createMockTempHandle();
         mockFs.readFile.mockResolvedValue('line1\nline2\nline3\n');
         mockFs.writeFile.mockResolvedValue(undefined);
-        mockFs.stat.mockResolvedValue({ mode: 0o100644 });
-        mockFs.chmod.mockResolvedValue(undefined);
+        mockFs.stat.mockResolvedValue({ mode: 0o100644, gid: 1000 });
+        mockFs.open.mockResolvedValue(tempHandle);
       });
 
       it('applies simple text replacement', async () => {
@@ -523,8 +589,13 @@ describe('Lib Functions', () => {
         
         expect(result).toContain('modified line2');
         // Should write to temporary file then rename
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'wx',
+          0o600
+        );
+        expect(mockFs.writeFile).toHaveBeenCalledWith(
+          tempHandle,
           'line1\nmodified line2\nline3\n',
           'utf-8'
         );
@@ -544,7 +615,7 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/file.txt', edits, false);
 
         expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          tempHandle,
           "line1\nprice=$$; match=$&; before=$`; after=$'\nline3\n",
           'utf-8'
         );
@@ -572,7 +643,7 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/file.txt', edits, false);
         
         expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          tempHandle,
           'first line\nline2\nthird line\n',
           'utf-8'
         );
@@ -594,7 +665,7 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/file.txt', edits, false);
         
         expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          tempHandle,
           '  line1\n    modified line2\n  line3\n',
           'utf-8'
         );
@@ -615,7 +686,23 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/script.sh', edits, false);
         
         expect(mockFs.stat).toHaveBeenCalledWith('/test/script.sh');
-        expect(mockFs.chmod).toHaveBeenCalledWith('/test/script.sh', 0o755);
+        expect(tempHandle.chmod).toHaveBeenCalledWith(0o755);
+        expect(tempHandle.chmod.mock.invocationCallOrder[0])
+          .toBeLessThan(mockFs.rename.mock.invocationCallOrder[0]);
+      });
+
+      it('fails the edit and removes the temp file when chmod fails', async () => {
+        tempHandle.chmod.mockRejectedValueOnce(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
+        mockFs.unlink.mockResolvedValueOnce(undefined);
+        const edits = [
+          { oldText: 'line2', newText: 'modified line2' }
+        ];
+
+        await expect(applyFileEdits('/test/file.txt', edits, false)).rejects.toThrow('EPERM');
+        expect(mockFs.rename).not.toHaveBeenCalled();
+        expect(mockFs.unlink).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/)
+        );
       });
 
       it('does not restore permissions in dry run mode', async () => {
@@ -625,7 +712,8 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.txt', edits, true);
         
-        expect(mockFs.chmod).not.toHaveBeenCalled();
+        expect(mockFs.open).not.toHaveBeenCalled();
+        expect(tempHandle.chmod).not.toHaveBeenCalled();
       });
 
       it('throws error for non-matching edits', async () => {
@@ -652,7 +740,7 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/file.js', edits, false);
         
         expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
+          tempHandle,
           'function test() {\n  console.log("world");\n  console.log("test");\n  return false;\n}',
           'utf-8'
         );
@@ -677,7 +765,7 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/file.js', edits, false);
         
         expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
+          tempHandle,
           '    if (condition) {\n        doSomethingElse();\n        doAnotherThing();\n    }',
           'utf-8'
         );
@@ -699,7 +787,7 @@ describe('Lib Functions', () => {
         await applyFileEdits('/test/file.txt', edits, false);
         
         expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          tempHandle,
           'line1\nmodified line2\nline3\n',
           'utf-8'
         );
