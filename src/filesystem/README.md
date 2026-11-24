@@ -217,6 +217,8 @@ Note: you can provide sandboxed directories to the server by mounting them to `/
 ### Docker
 Note: all directories must be mounted to `/projects` by default.
 
+Note: the image runs as the unprivileged user uid/gid `1000:1000`, not root. Writable mounts must be writable by that uid (on Linux, pass `--user` with your own `uid:gid` if it differs), and files the server creates are owned by it. Mount directories the server should not change with `ro`.
+
 ```json
 {
   "mcpServers": {
@@ -297,6 +299,8 @@ You can provide sandboxed directories to the server by mounting them to `/projec
 
 ### Docker
 Note: all directories must be mounted to `/projects` by default. 
+
+Note: the image runs as the unprivileged user uid/gid `1000:1000`, not root. Writable mounts must be writable by that uid (on Linux, pass `--user` with your own `uid:gid` if it differs), and files the server creates are owned by it. Mount directories the server should not change with `ro`.
 
 ```json
 {
