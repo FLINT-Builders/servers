@@ -4,6 +4,7 @@ import {
   InMemoryTaskMessageQueue,
 } from "@modelcontextprotocol/sdk/experimental/tasks";
 import {
+  clearSubscriptions,
   setSubscriptionHandlers,
   stopSimulatedResourceUpdates,
 } from "../resources/subscriptions.js";
@@ -11,7 +12,7 @@ import { registerConditionalTools, registerTools } from "../tools/index.js";
 import { registerResources, readInstructions } from "../resources/index.js";
 import { registerPrompts } from "../prompts/index.js";
 import { stopSimulatedLogging } from "./logging.js";
-import { syncRoots } from "./roots.js";
+import { clearRoots, syncRoots } from "./roots.js";
 
 // Server Factory response
 export type ServerFactoryResponse = {
@@ -110,6 +111,9 @@ export const createServer: () => ServerFactoryResponse = () => {
       // Stop any simulated logging or resource updates that may have been initiated.
       stopSimulatedLogging(sessionId);
       stopSimulatedResourceUpdates(sessionId);
+      // Release state the client stored for this session
+      clearSubscriptions(server);
+      clearRoots(sessionId);
       // Clean up task store timers
       taskStore.cleanup();
       if (initializeTimeout) clearTimeout(initializeTimeout);

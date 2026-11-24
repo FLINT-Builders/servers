@@ -23,10 +23,11 @@
 
 ### Module: `resources/subscriptions.ts`
 
-- Tracks subscribers per URI: `Map<uri, Set<sessionId>>`.
+- Tracks subscribed URIs per server instance (one per session): `Map<McpServer, Set<uri>>`.
 - Installs handlers via `setSubscriptionHandlers(server)` to process subscribe/unsubscribe requests and keep the map updated.
+- Rejects URIs longer than `MAX_RESOURCE_SUBSCRIPTION_URI_LENGTH` (2048) and new subscriptions once the process holds `MAX_RESOURCE_SUBSCRIPTIONS` (32).
 - Updates are started/stopped on demand by the `toggle-subscriber-updates` tool, which calls `beginSimulatedResourceUpdates(server, sessionId)` and `stopSimulatedResourceUpdates(sessionId)`.
-- `cleanup(sessionId?)` calls `stopSimulatedResourceUpdates(sessionId)` to clear intervals and remove session‑scoped state.
+- `cleanup(sessionId?)` calls `stopSimulatedResourceUpdates(sessionId)` to clear intervals and `clearSubscriptions(server)` to release the session's subscriptions.
 
 ## Session‑scoped Resources
 

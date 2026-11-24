@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   beginSimulatedResourceUpdates,
+  isSimulatingResourceUpdates,
   stopSimulatedResourceUpdates,
 } from "../resources/subscriptions.js";
 
@@ -18,9 +19,6 @@ const config = {
     openWorldHint: false,
   },
 };
-
-// Track enabled clients by session id
-const clients: Set<string | undefined> = new Set<string | undefined>();
 
 /**
  * Registers the `toggle-subscriber-updates` tool.
@@ -45,13 +43,11 @@ export const registerToggleSubscriberUpdatesTool = (server: McpServer) => {
       const sessionId = extra?.sessionId;
 
       let response: string;
-      if (clients.has(sessionId)) {
+      if (isSimulatingResourceUpdates(sessionId)) {
         stopSimulatedResourceUpdates(sessionId);
-        clients.delete(sessionId);
         response = `Stopped simulated resource updates for session ${sessionId}`;
       } else {
         beginSimulatedResourceUpdates(server, sessionId);
-        clients.add(sessionId);
         response = `Started simulated resource updated notifications for session ${sessionId} at a 5 second pace. Client will receive updates for any resources the it is subscribed to.`;
       }
 
