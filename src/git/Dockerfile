@@ -10,6 +10,11 @@ ENV UV_COMPILE_BYTECODE=1
 # Copy from the cache instead of linking since it's a mounted volume
 ENV UV_LINK_MODE=copy
 
+# Install the managed interpreter outside /root (mode 0700) so the
+# unprivileged runtime user can execute it through the venv symlink
+ENV UV_PYTHON_INSTALL_DIR=/python
+ENV UV_PYTHON_PREFERENCE=only-managed
+
 # Install the project's dependencies using the lockfile and settings
 COPY uv.lock pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -28,15 +33,18 @@ RUN apt-get update && apt-get install -y git git-lfs && rm -rf /var/lib/apt/list
 
 WORKDIR /app
  
-COPY --from=uv /root/.local /root/.local
+COPY --from=uv /python /python
 
 RUN if ! id -u app >/dev/null 2>&1; then \
       useradd -rUM -s /usr/sbin/nologin app; \
     fi
-COPY --from=uv --chown=app:app /app/.venv /app/.venv
+COPY --from=uv /app/.venv /app/.venv
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
+
+# Git commands, hooks and filters write the bind-mounted repository, so never run them as root
+USER app
 
 # when running the container, add --db-path and a bind mount to the host's db file
 ENTRYPOINT ["mcp-server-git"]

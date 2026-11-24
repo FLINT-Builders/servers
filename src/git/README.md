@@ -144,12 +144,13 @@ Add this to your `claude_desktop_config.json`:
 <summary>Using docker</summary>
 
 * Note: replace '/Users/username' with a path that you want to be accessible by this tool
+* Note: the image runs as an unprivileged `app` user, never as root. Replace `1000:1000` with the uid and gid that own the mounted directory (`id -u` and `id -g` on the host), so that Git accepts the repository and the files it writes stay owned by you. Without `--user`, the mount must be owned by the image's `app` user.
 
 ```json
 "mcpServers": {
   "git": {
     "command": "docker",
-    "args": ["run", "--rm", "-i", "--mount", "type=bind,src=/Users/username,dst=/Users/username", "mcp/git"]
+    "args": ["run", "--rm", "-i", "--user", "1000:1000", "--mount", "type=bind,src=/Users/username,dst=/Users/username", "mcp/git"]
   }
 }
 ```
