@@ -8,8 +8,8 @@ Source: https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
 
 Requires MCP Python SDK 1.x (`mcp>=1.29.0,<2`). SDK 2.0 renamed APIs this server uses. The port to v2 is in progress.
 
-> [!CAUTION]
-> This server can access local/internal IP addresses and may represent a security risk. Exercise caution when using this MCP server to ensure this does not expose any sensitive data.
+> [!NOTE]
+> The server only fetches `http` and `https` URLs on public internet addresses. Before each request, including every redirect and the robots.txt check, it resolves the host and refuses to connect if any resolved address is loopback, private, link-local (such as cloud metadata endpoints), or otherwise non-public. The connection is then made to the address that was checked, so the host is not resolved a second time.
 
 The fetch tool will truncate the response, but by using the `start_index` argument, you can specify where to start the content extraction. This lets models read a webpage in chunks, until they find the information they need.
 
@@ -172,7 +172,10 @@ This can be customized by adding the argument `--user-agent=YourUserAgent` to th
 
 ### Customization - Proxy
 
-The server can be configured to use a proxy by using the `--proxy-url` argument.
+The server can be configured to use a proxy by using the `--proxy-url` argument. Proxy environment variables such as
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are ignored. When a proxy is configured, the server still resolves and
+checks each destination itself and asks the proxy to connect to the checked address, so the server must be able to
+resolve public hostnames.
 
 ## Windows Configuration
 

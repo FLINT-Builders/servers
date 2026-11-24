@@ -1,6 +1,13 @@
-from typing import Annotated, Tuple
+import asyncio
+import ipaddress
+import os
+import socket
+import ssl
+from typing import Annotated, Any, Tuple
 from urllib.parse import urlparse, urlunparse
 
+import certifi
+import httpx
 import markdownify
 import readabilipy.simple_json
 from mcp.shared.exceptions import McpError
@@ -22,6 +29,152 @@ from pydantic import BaseModel, Field, AnyUrl
 
 DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
 DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
+
+ROBOTS_TXT_TIMEOUT = 5.0
+FETCH_TIMEOUT = 30.0
+MAX_REDIRECTS = 20
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_NAT64_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def is_public_address(address: IPAddress) -> bool:
+    """Return True only for globally routable unicast addresses.
+
+    IPv6 forms that embed an IPv4 address (mapped, 6to4, Teredo, NAT64) are
+    judged by the embedded address as well.
+    """
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = address.ipv4_mapped or address.sixtofour
+        if embedded is None and address.teredo is not None:
+            embedded = address.teredo[1]
+        if embedded is None and address in _NAT64_PREFIX:
+            embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+        if embedded is not None and not is_public_address(embedded):
+            return False
+    return address.is_global and not address.is_multicast
+
+
+async def resolve_public_address(url: httpx.URL, timeout: float) -> str:
+    """Resolve the URL's host once and return an address to connect to.
+
+    Raises McpError unless every address the host resolves to is public.
+    """
+    host = url.raw_host.decode("ascii")
+    if not host:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"URL has no host: {url}"))
+
+    addresses: list[IPAddress]
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        port = url.port or (443 if url.scheme == "https" else 80)
+        try:
+            infos = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
+                timeout,
+            )
+        except (OSError, asyncio.TimeoutError) as e:
+            raise httpx.ConnectError(f"Failed to resolve {host}: {e!r}") from e
+        addresses = [
+            ipaddress.ip_address(info[4][0])
+            for info in infos
+            if info[0] in (socket.AF_INET, socket.AF_INET6)
+        ]
+
+    if not addresses or not all(is_public_address(address) for address in addresses):
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"Refusing to fetch {url}: {host} is not a public internet address. "
+            "Loopback, private, link-local and other non-public addresses are blocked.",
+        ))
+    return str(addresses[0])
+
+
+class _PinnedHostnameSSLContext(ssl.SSLContext):
+    """Verifies the certificate for `hostname` on a connection made to `pinned_address`."""
+
+    pinned_address: str = ""
+    hostname: str = ""
+
+    def _server_hostname(self, server_hostname: Any) -> Any:
+        return self.hostname if server_hostname == self.pinned_address else server_hostname
+
+    def wrap_bio(self, incoming: Any, outgoing: Any, server_side: bool = False, server_hostname: Any = None, session: Any = None) -> Any:
+        return super().wrap_bio(
+            incoming, outgoing, server_side=server_side,
+            server_hostname=self._server_hostname(server_hostname), session=session,
+        )
+
+    def wrap_socket(self, sock: Any, server_side: bool = False, do_handshake_on_connect: bool = True,
+                    suppress_ragged_eofs: bool = True, server_hostname: Any = None, session: Any = None) -> Any:
+        return super().wrap_socket(
+            sock, server_side=server_side, do_handshake_on_connect=do_handshake_on_connect,
+            suppress_ragged_eofs=suppress_ragged_eofs,
+            server_hostname=self._server_hostname(server_hostname), session=session,
+        )
+
+
+def _pinned_ssl_context(pinned_address: str, hostname: str) -> ssl.SSLContext:
+    context = _PinnedHostnameSSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.pinned_address = pinned_address
+    context.hostname = hostname
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.hostname_checks_common_name = False
+    ca_file = os.environ.get("SSL_CERT_FILE")
+    ca_dir = os.environ.get("SSL_CERT_DIR")
+    if ca_file and os.path.isfile(ca_file):
+        context.load_verify_locations(cafile=ca_file)
+    elif ca_dir and os.path.isdir(ca_dir):
+        context.load_verify_locations(capath=ca_dir)
+    else:
+        context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
+async def _get_pinned(url: httpx.URL, user_agent: str, proxy_url: str | None, timeout: float) -> httpx.Response:
+    """Send one GET, without following redirects, to an address validated for this URL.
+
+    The request goes to the validated address itself (also through a proxy), so
+    nothing resolves the hostname again between the check and the connection.
+    Proxy settings from the environment are ignored; only `proxy_url` is used.
+    """
+    if url.scheme not in ("http", "https"):
+        raise httpx.UnsupportedProtocol(f"Request URL has an unsupported protocol '{url.scheme}://'.")
+    address = await resolve_public_address(url, timeout)
+    hostname = url.raw_host.decode("ascii")
+    transport = httpx.AsyncHTTPTransport(
+        verify=_pinned_ssl_context(address, hostname),
+        proxy=proxy_url,
+    )
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        return await client.get(
+            url.copy_with(host=address),
+            headers={"User-Agent": user_agent, "Host": url.netloc.decode("ascii")},
+            follow_redirects=False,
+            timeout=timeout,
+        )
+
+
+async def guarded_get(url: str, user_agent: str, proxy_url: str | None, timeout: float) -> httpx.Response:
+    """GET `url`, following redirects, checking the destination of every hop."""
+    try:
+        target = httpx.URL(url)
+        redirects = 0
+        while True:
+            response = await _get_pinned(target, user_agent, proxy_url, timeout)
+            location = response.headers.get("location")
+            if response.status_code not in _REDIRECT_STATUS_CODES or not location:
+                return response
+            redirects += 1
+            if redirects > MAX_REDIRECTS:
+                raise httpx.TooManyRedirects(
+                    f"Exceeded {MAX_REDIRECTS} redirects while fetching {url}", request=response.request
+                )
+            target = target.join(location)
+    except httpx.InvalidURL as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid URL {url}: {e}"))
 
 
 def extract_content_from_html(html: str) -> str:
@@ -68,30 +221,23 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url:
     Check if the URL can be fetched by the user agent according to the robots.txt file.
     Raises a McpError if not.
     """
-    from httpx import AsyncClient, HTTPError
-
     robot_txt_url = get_robots_txt_url(url)
 
-    async with AsyncClient(proxy=proxy_url) as client:
-        try:
-            response = await client.get(
-                robot_txt_url,
-                follow_redirects=True,
-                headers={"User-Agent": user_agent},
-            )
-        except HTTPError:
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue",
-            ))
-        if response.status_code in (401, 403):
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt",
-            ))
-        elif 400 <= response.status_code < 500:
-            return
-        robot_txt = response.text
+    try:
+        response = await guarded_get(robot_txt_url, user_agent, proxy_url, ROBOTS_TXT_TIMEOUT)
+    except httpx.HTTPError:
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue",
+        ))
+    if response.status_code in (401, 403):
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt",
+        ))
+    elif 400 <= response.status_code < 500:
+        return
+    robot_txt = response.text
     processed_robot_txt = "\n".join(
         line for line in robot_txt.splitlines() if not line.strip().startswith("#")
     )
@@ -114,25 +260,17 @@ async def fetch_url(
     """
     Fetch the URL and return the content in a form ready for the LLM, as well as a prefix string with status information.
     """
-    from httpx import AsyncClient, HTTPError
+    try:
+        response = await guarded_get(url, user_agent, proxy_url, FETCH_TIMEOUT)
+    except httpx.HTTPError as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
+    if response.status_code >= 400:
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"Failed to fetch {url} - status code {response.status_code}",
+        ))
 
-    async with AsyncClient(proxy=proxy_url) as client:
-        try:
-            response = await client.get(
-                url,
-                follow_redirects=True,
-                headers={"User-Agent": user_agent},
-                timeout=30,
-            )
-        except HTTPError as e:
-            raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
-        if response.status_code >= 400:
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Failed to fetch {url} - status code {response.status_code}",
-            ))
-
-        page_raw = response.text
+    page_raw = response.text
 
     content_type = response.headers.get("content-type", "")
     is_page_html = (

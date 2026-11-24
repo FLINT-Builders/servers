@@ -13,6 +13,16 @@ from mcp_server_fetch.server import (
 )
 
 
+@pytest.fixture
+def public_resolution():
+    """Resolve every host to a public address so mocked clients see no DNS."""
+    with patch(
+        "mcp_server_fetch.server.resolve_public_address",
+        AsyncMock(return_value="93.184.215.14"),
+    ):
+        yield
+
+
 class TestGetRobotsTxtUrl:
     """Tests for get_robots_txt_url function."""
 
@@ -88,6 +98,7 @@ class TestExtractContentFromHtml:
         assert "<error>" in result
 
 
+@pytest.mark.usefixtures("public_resolution")
 class TestCheckMayAutonomouslyFetchUrl:
     """Tests for check_may_autonomously_fetch_url function."""
 
@@ -184,6 +195,7 @@ class TestCheckMayAutonomouslyFetchUrl:
                 )
 
 
+@pytest.mark.usefixtures("public_resolution")
 class TestFetchUrl:
     """Tests for fetch_url function."""
 
@@ -310,7 +322,8 @@ class TestFetchUrl:
         mock_response.text = '{"data": "test"}'
         mock_response.headers = {"content-type": "application/json"}
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx.AsyncClient") as mock_client_class, \
+                patch("httpx.AsyncHTTPTransport") as mock_transport_class:
             mock_client = AsyncMock()
             mock_client.get = AsyncMock(return_value=mock_response)
             mock_client_class.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -322,5 +335,8 @@ class TestFetchUrl:
                 proxy_url="http://proxy.example.com:8080"
             )
 
-            # Verify AsyncClient was called with proxy
-            mock_client_class.assert_called_once_with(proxy="http://proxy.example.com:8080")
+            # Verify the transport was given the proxy and environment proxies are ignored
+            assert mock_transport_class.call_args.kwargs["proxy"] == "http://proxy.example.com:8080"
+            mock_client_class.assert_called_once_with(
+                transport=mock_transport_class.return_value, trust_env=False
+            )
