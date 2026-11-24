@@ -489,7 +489,9 @@ server.registerTool(
       entries.map(async (entry) => {
         const entryPath = path.join(validPath, entry.name);
         try {
-          const stats = await fs.stat(entryPath);
+          // lstat, not stat: a child symlink may point outside the allowed
+          // directories, and following it would report the target's metadata.
+          const stats = await fs.lstat(entryPath);
           return {
             name: entry.name,
             isDirectory: entry.isDirectory(),
