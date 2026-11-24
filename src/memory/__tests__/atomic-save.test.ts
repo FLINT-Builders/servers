@@ -114,6 +114,59 @@ describe('KnowledgeGraphManager persistence durability', () => {
     expect(await fs.readdir(testDir)).toEqual(['memory.jsonl']);
   });
 
+  it.skipIf(process.platform === 'win32')('keeps a private memory file private across saves', async () => {
+    const manager = new KnowledgeGraphManager(testFilePath);
+    await manager.createEntities([
+      { name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
+    ]);
+    await fs.chmod(testFilePath, 0o600);
+
+    const openSpy = vi.spyOn(fs, 'open');
+    const previousUmask = process.umask(0o022);
+    try {
+      await manager.createEntities([
+        { name: 'Bob', entityType: 'person', observations: ['likes programming'] },
+      ]);
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    const tempOpens = openSpy.mock.calls.filter(call => String(call[0]).endsWith('.tmp'));
+    expect(tempOpens).toHaveLength(1);
+    expect(tempOpens[0][1]).toBe('wx');
+    expect(tempOpens[0][2]).toBe(0o600);
+    expect((await fs.stat(testFilePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it.skipIf(process.platform === 'win32')('fails the save without replacing the graph when the mode cannot be restored', async () => {
+    const manager = new KnowledgeGraphManager(testFilePath);
+    await manager.createEntities([
+      { name: 'Alice', entityType: 'person', observations: ['works at Acme Corp'] },
+    ]);
+    await fs.chmod(testFilePath, 0o600);
+    const before = await fs.readFile(testFilePath, 'utf-8');
+
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementationOnce(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await realOpen(...args);
+      vi.spyOn(handle, 'chmod').mockRejectedValueOnce(
+        Object.assign(new Error('EPERM: simulated chmod failure'), { code: 'EPERM' })
+      );
+      return handle;
+    });
+
+    await expect(
+      manager.createEntities([
+        { name: 'Bob', entityType: 'person', observations: ['likes programming'] },
+      ])
+    ).rejects.toThrow('EPERM');
+
+    vi.restoreAllMocks();
+    expect(await fs.readFile(testFilePath, 'utf-8')).toBe(before);
+    expect((await fs.stat(testFilePath)).mode & 0o777).toBe(0o600);
+    expect(await fs.readdir(testDir)).toEqual(['memory.jsonl']);
+  });
+
   it('still persists graph contents correctly across reloads', async () => {
     const manager = new KnowledgeGraphManager(testFilePath);
     await manager.createEntities([

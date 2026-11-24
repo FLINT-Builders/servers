@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { promises as fs } from 'fs';
+import { promises as fs, type Stats } from 'fs';
 import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
@@ -183,14 +183,48 @@ export class KnowledgeGraphManager {
     // complete old file or the complete new one, never a partial state.
     // The temp file is kept in the same directory so the rename stays on one
     // filesystem — renaming across mount points fails with EXDEV.
+    //
+    // Anyone who can list that directory can try to open the temp file, so
+    // when the memory file already exists the temp file is created with at
+    // most 0600 (or the original mode, if stricter) before any bytes are
+    // written, and gets the original group and mode through the same handle
+    // before rename. Any failure aborts the save, so the graph is never more
+    // accessible than the file it replaces.
+    let origStats: Stats | undefined;
+    try {
+      origStats = await fs.stat(this.memoryFilePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
     const directory = path.dirname(this.memoryFilePath);
     const tempFilePath = path.join(
       directory,
       `${path.basename(this.memoryFilePath)}.${randomBytes(16).toString('hex')}.tmp`
     );
 
+    const handle = await fs.open(tempFilePath, 'wx', origStats ? origStats.mode & 0o600 : 0o666);
     try {
-      await fs.writeFile(tempFilePath, lines.join("\n") + "\n");
+      try {
+        await fs.writeFile(handle, lines.join("\n") + "\n");
+        if (origStats) {
+          // Mask off the file-type bits; POSIX leaves them unspecified for chmod.
+          let mode = origStats.mode & 0o777;
+          const tempStats = await handle.stat();
+          if (tempStats.gid !== origStats.gid) {
+            try {
+              await handle.chown(tempStats.uid, origStats.gid);
+            } catch {
+              // Group bits would otherwise grant access to a different group.
+              mode &= ~0o070;
+            }
+          }
+          await handle.chmod(mode);
+        }
+      } finally {
+        await handle.close();
+      }
       await fs.rename(tempFilePath, this.memoryFilePath);
     } catch (error) {
       // Never leave a stray temp file behind on failure.
