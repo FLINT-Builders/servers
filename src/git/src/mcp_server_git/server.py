@@ -253,6 +253,56 @@ def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None
         )
 
 
+def _git_dir_from_dotgit(dotgit: Path) -> Path | None:
+    """Return the git directory a working tree's .git entry refers to."""
+    if dotgit.is_dir():
+        return dotgit
+    if dotgit.is_file():
+        try:
+            content = dotgit.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if content.startswith("gitdir: "):
+            return dotgit.parent / content[len("gitdir: "):]
+    return None
+
+
+def open_repo(repo_path: Path, allowed_repository: Path | None) -> git.Repo:
+    """Open the working tree at repo_path, refusing anything else git would accept.
+
+    Git and GitPython treat any directory containing HEAD, objects and refs as a
+    repository and honor its config and hooks. Such a directory can be committed
+    as ordinary files, so only a working tree is accepted, and its repository must
+    be the one named by its own .git entry, which git never checks out from a tree.
+    """
+    try:
+        resolved = repo_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError(f"Invalid path: {repo_path}")
+
+    validate_repo_path(resolved, allowed_repository)
+
+    working_tree = resolved.parent if resolved.name == ".git" else resolved
+    expected_git_dir = _git_dir_from_dotgit(working_tree / ".git")
+    if expected_git_dir is None:
+        raise git.InvalidGitRepositoryError(
+            f"'{repo_path}' is not the top level of a git working tree"
+        )
+
+    repo = git.Repo(working_tree)
+    if (
+        repo.bare
+        or repo.working_tree_dir is None
+        or Path(repo.working_tree_dir).resolve() != working_tree
+        or Path(repo.git_dir).resolve() != expected_git_dir.resolve()
+    ):
+        repo.close()
+        raise git.InvalidGitRepositoryError(
+            f"'{repo_path}' is not the top level of a git working tree"
+        )
+    return repo
+
+
 def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, not_contains: str | None = None) -> str:
     # Defense in depth: reject values starting with '-' to prevent flag injection
     if contains and contains.startswith("-"):
@@ -471,11 +521,7 @@ async def serve(repository: Path | None) -> None:
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         repo_path = Path(arguments["repo_path"])
 
-        # Validate repo_path is within allowed repository
-        validate_repo_path(repo_path, repository)
-
-        # For all commands, we need an existing repo
-        repo = git.Repo(repo_path)
+        repo = open_repo(repo_path, repository)
 
         match name:
             case GitTools.STATUS:
