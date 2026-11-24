@@ -23,6 +23,11 @@ const GZIP_ALLOWED_DOMAINS = (process.env.GZIP_ALLOWED_DOMAINS ?? "")
   .map((d) => d.trim().toLowerCase())
   .filter((d) => d.length > 0);
 
+// Maximum number of HTTP redirects followed per fetch.
+const GZIP_MAX_REDIRECTS = 5;
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 // Tool input schema
 const GZipFileAsResourceSchema = z.object({
   name: z.string().describe("Name of the output file").default("README.md.gz"),
@@ -191,8 +196,10 @@ async function fetchSafely(
   );
 
   try {
-    // Fetch the data
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetchFollowingValidatedRedirects(
+      url,
+      controller.signal
+    );
     if (!response.body) {
       throw new Error("No response body");
     }
@@ -244,5 +251,50 @@ async function fetchSafely(
     return buffer.buffer;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/**
+ * Fetches a URL without letting the runtime follow redirects on its own. Each redirect target is
+ * resolved against the current URL and passed through `validateDataURI` before it is requested,
+ * so every hop is subject to the same protocol and allowed-domains rules as the original URL.
+ *
+ * @param {URL} url The validated URL to fetch.
+ * @param {AbortSignal} signal Signal that aborts the whole redirect chain.
+ * @return {Promise<Response>} The first non-redirect response.
+ * @throws {Error} If a redirect target is invalid or disallowed, or the redirect limit is exceeded.
+ */
+async function fetchFollowingValidatedRedirects(
+  url: URL,
+  signal: AbortSignal
+): Promise<Response> {
+  let current = url;
+  for (let hops = 0; ; hops++) {
+    const response = await fetch(current, { signal, redirect: "manual" });
+    if (!REDIRECT_STATUSES.has(response.status)) {
+      return response;
+    }
+
+    await response.body?.cancel();
+
+    const location = response.headers.get("location");
+    if (location === null) {
+      throw new Error(
+        `Redirect from ${current} (status ${response.status}) has no Location header`
+      );
+    }
+    if (hops >= GZIP_MAX_REDIRECTS) {
+      throw new Error(
+        `Fetching ${url} exceeded the maximum of ${GZIP_MAX_REDIRECTS} redirects`
+      );
+    }
+
+    const next = validateDataURI(new URL(location, current).href);
+    if (next.protocol !== "http:" && next.protocol !== "https:") {
+      throw new Error(
+        `Redirect from ${current} to unsupported protocol ${next.protocol}`
+      );
+    }
+    current = next;
   }
 }
