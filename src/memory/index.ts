@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { promises as fs } from 'fs';
+import type { FileHandle } from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { randomBytes } from 'crypto';
@@ -58,6 +59,33 @@ export async function ensureMemoryFilePath(): Promise<string> {
   } catch {
     // Old file doesn't exist, use new path
     return newMemoryPath;
+  }
+}
+
+// Owner read/write only: the graph can hold anything the user asked to keep.
+export const MEMORY_FILE_MODE = 0o600;
+
+// Memory files written by earlier versions (or carried over by the memory.json
+// migration) kept the umask mode, typically 0644. Tighten an existing file at
+// startup so it is private even if this session never saves. The mode is read
+// and changed through one handle, so it applies to the file that was opened.
+export async function restrictMemoryFileMode(memoryFilePath: string): Promise<void> {
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(memoryFilePath, 'r');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  try {
+    const { mode } = await handle.stat();
+    if ((mode & 0o777) !== MEMORY_FILE_MODE) {
+      await handle.chmod(MEMORY_FILE_MODE);
+    }
+  } finally {
+    await handle.close();
   }
 }
 
@@ -189,11 +217,24 @@ export class KnowledgeGraphManager {
       `${path.basename(this.memoryFilePath)}.${randomBytes(16).toString('hex')}.tmp`
     );
 
+    // The graph must never be readable by other local users, not even while
+    // the temp file is being written. The mode is applied at creation (umask
+    // can only clear bits from it) and the fchmod on the same handle pins it to
+    // exactly 0600 whatever the umask; rename(2) keeps the inode's mode. If the
+    // 'wx' open fails the path is not ours, so there is nothing to clean up.
+    const handle = await fs.open(tempFilePath, 'wx', MEMORY_FILE_MODE);
+    let closed = false;
     try {
-      await fs.writeFile(tempFilePath, lines.join("\n") + "\n");
+      await handle.chmod(MEMORY_FILE_MODE);
+      await fs.writeFile(handle, lines.join("\n") + "\n");
+      closed = true;
+      await handle.close();
       await fs.rename(tempFilePath, this.memoryFilePath);
     } catch (error) {
       // Never leave a stray temp file behind on failure.
+      if (!closed) {
+        await handle.close().catch(() => {});
+      }
       await fs.unlink(tempFilePath).catch(() => {});
       throw error;
     }
@@ -730,6 +771,9 @@ export function registerKnowledgeGraphSubscriptions(server: McpServer) {
 
 async function main() {
   MEMORY_FILE_PATH = await ensureMemoryFilePath();
+  await restrictMemoryFileMode(MEMORY_FILE_PATH).catch((error) => {
+    console.error(`WARNING: Could not restrict permissions on ${MEMORY_FILE_PATH}: ${error instanceof Error ? error.message : error}`);
+  });
   knowledgeGraphManager = new KnowledgeGraphManager(MEMORY_FILE_PATH);
   registerKnowledgeGraphResource(server, knowledgeGraphManager);
   registerKnowledgeGraphSubscriptions(server);
