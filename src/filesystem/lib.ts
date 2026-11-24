@@ -202,6 +202,47 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
   return await fs.readFile(filePath, encoding as BufferEncoding);
 }
 
+// Security: Replace an existing file through a same-directory temp file and an
+// atomic rename, so a symlink created at filePath between validation and write
+// is replaced rather than followed.
+//
+// The temp file sits next to the target, so anyone who can list the directory
+// can try to open it. It is therefore created exclusively with at most 0600
+// (or the original mode, if stricter) before any bytes are written, and the
+// original group and mode are applied through the same handle before rename.
+// Any failure aborts the operation, so the new body is never more accessible
+// than the file it replaces.
+async function replaceFileAtomically(filePath: string, content: string): Promise<void> {
+  const origStats = await fs.stat(filePath);
+  // Mask off the file-type bits; POSIX leaves them unspecified for chmod.
+  let mode = origStats.mode & 0o777;
+  const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
+  const handle = await fs.open(tempPath, 'wx', mode & 0o600);
+  try {
+    try {
+      await fs.writeFile(handle, content, 'utf-8');
+      const tempStats = await handle.stat();
+      if (tempStats.gid !== origStats.gid) {
+        try {
+          await handle.chown(tempStats.uid, origStats.gid);
+        } catch {
+          // Group bits would otherwise grant access to a different group.
+          mode &= ~0o070;
+        }
+      }
+      await handle.chmod(mode);
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {}
+    throw error;
+  }
+}
+
 export async function writeFileContent(filePath: string, content: string): Promise<void> {
   try {
     // Security: 'wx' flag ensures exclusive creation - fails if file/symlink exists,
@@ -209,27 +250,7 @@ export async function writeFileContent(filePath: string, content: string): Promi
     await fs.writeFile(filePath, content, { encoding: "utf-8", flag: 'wx' });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      // Security: Use atomic rename to prevent race conditions where symlinks
-      // could be created between validation and write. Rename operations
-      // replace the target file atomically and don't follow symlinks.
-      const origStats = await fs.stat(filePath);
-      const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-      try {
-        await fs.writeFile(tempPath, content, 'utf-8');
-        await fs.rename(tempPath, filePath);
-      } catch (renameError) {
-        try {
-          await fs.unlink(tempPath);
-        } catch {}
-        throw renameError;
-      }
-      // Restore original permission bits since the atomic rename replaces the
-      // inode and the temp file has default (0644) permissions. Mask off the
-      // file-type bits; POSIX leaves them unspecified for chmod. A chmod
-      // failure must not fail the write, which has already succeeded.
-      try {
-        await fs.chmod(filePath, origStats.mode & 0o777);
-      } catch {}
+      await replaceFileAtomically(filePath, content);
     } else {
       throw error;
     }
@@ -334,27 +355,7 @@ export async function applyFileEdits(
   const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
 
   if (!dryRun) {
-    // Security: Use atomic rename to prevent race conditions where symlinks
-    // could be created between validation and write. Rename operations
-    // replace the target file atomically and don't follow symlinks.
-    const origStats = await fs.stat(filePath);
-    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-    try {
-      await fs.writeFile(tempPath, modifiedContent, 'utf-8');
-      await fs.rename(tempPath, filePath);
-    } catch (error) {
-      try {
-        await fs.unlink(tempPath);
-      } catch {}
-      throw error;
-    }
-    // Restore original permission bits since the atomic rename replaces the
-    // inode and the temp file has default (0644) permissions. Mask off the
-    // file-type bits; POSIX leaves them unspecified for chmod. A chmod
-    // failure must not fail the write, which has already succeeded.
-    try {
-      await fs.chmod(filePath, origStats.mode & 0o777);
-    } catch {}
+    await replaceFileAtomically(filePath, modifiedContent);
   }
 
   return formattedDiff;
