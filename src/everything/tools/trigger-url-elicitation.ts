@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   CallToolResult,
@@ -10,13 +10,14 @@ import { z } from "zod";
 
 // Tool input schema
 const TriggerUrlElicitationSchema = z.object({
-  url: z.string().url().describe("The URL the user should open"),
+  url: z.string().max(8192).url().describe("The URL the user should open"),
   message: z
     .string()
     .default("Please open the link to complete this action.")
     .describe("Message shown to the user before opening the URL"),
   elicitationId: z
     .string()
+    .max(256)
     .optional()
     .describe("Optional explicit elicitation ID. Defaults to a random UUID."),
   errorPath: z
@@ -52,8 +53,9 @@ const config = {
 
 /**
  * Tracks requests for which an error-path prerequisite has already been issued,
- * keyed by the stable inputs a client resends when it retries the original tool
- * call (session + URL + caller-supplied elicitationId).
+ * keyed by session and then by a digest of the stable inputs a client resends
+ * when it retries the original tool call (URL + caller-supplied elicitationId).
+ * Values are the time the prerequisite was issued.
  *
  * When the client satisfies the prerequisite and retries the same call, the
  * matching entry lets us recognize the retry, ignore `errorPath`, and proceed
@@ -61,13 +63,73 @@ const config = {
  * which would otherwise loop forever (throw -> client satisfies prerequisite ->
  * retry -> throw -> ...).
  *
- * Demo simplification: entries are only removed on a recognized retry, so a
- * client that triggers the error path and never retries leaves its key behind.
- * That is acceptable for this reference server; a production implementation
- * serving many long-lived sessions should evict entries (e.g. a
- * `Map<string, timestamp>` with TTL-based cleanup).
+ * Callers control the URL and elicitationId, so retention is bounded: entries
+ * are fixed-size digests, expire after ERROR_PATH_ENTRY_TTL_MS, are capped per
+ * session and by number of tracked sessions (least recently used evicted
+ * first), and are dropped when the session is cleaned up.
  */
-const issuedErrorPathElicitations = new Set<string>();
+const issuedErrorPathElicitations = new Map<string, Map<string, number>>();
+
+const MAX_ERROR_PATH_KEYS_PER_SESSION = 16;
+const MAX_ERROR_PATH_SESSIONS = 1024;
+const ERROR_PATH_ENTRY_TTL_MS = 10 * 60 * 1000;
+
+const errorPathDigest = (url: string, requestedElicitationId?: string) =>
+  createHash("sha256")
+    .update(JSON.stringify([url, requestedElicitationId ?? null]))
+    .digest("base64");
+
+const pruneExpiredErrorPathKeys = (keys: Map<string, number>, now: number) => {
+  for (const [key, issuedAt] of keys) {
+    if (now - issuedAt > ERROR_PATH_ENTRY_TTL_MS || now < issuedAt) {
+      keys.delete(key);
+    }
+  }
+};
+
+/**
+ * Removes the marker for a retried request and reports whether it was live.
+ */
+const consumeErrorPathKey = (sessionId: string, key: string): boolean => {
+  const keys = issuedErrorPathElicitations.get(sessionId);
+  if (!keys) return false;
+  pruneExpiredErrorPathKeys(keys, Date.now());
+  const found = keys.delete(key);
+  if (keys.size === 0) issuedErrorPathElicitations.delete(sessionId);
+  return found;
+};
+
+const recordErrorPathKey = (sessionId: string, key: string) => {
+  const now = Date.now();
+  const keys = issuedErrorPathElicitations.get(sessionId) ?? new Map();
+  issuedErrorPathElicitations.delete(sessionId);
+  pruneExpiredErrorPathKeys(keys, now);
+  keys.delete(key);
+  while (keys.size >= MAX_ERROR_PATH_KEYS_PER_SESSION) {
+    const oldest = keys.keys().next().value as string;
+    keys.delete(oldest);
+  }
+  keys.set(key, now);
+  issuedErrorPathElicitations.set(sessionId, keys);
+  while (issuedErrorPathElicitations.size > MAX_ERROR_PATH_SESSIONS) {
+    const oldest = issuedErrorPathElicitations.keys().next().value as string;
+    issuedErrorPathElicitations.delete(oldest);
+  }
+};
+
+/**
+ * Drops error-path markers for a closing session. With no session id (the
+ * single-session stdio transport), drops all markers.
+ *
+ * @param {string} [sessionId] - The session being cleaned up.
+ */
+export const clearIssuedErrorPathElicitations = (sessionId?: string) => {
+  if (sessionId === undefined) {
+    issuedErrorPathElicitations.clear();
+  } else {
+    issuedErrorPathElicitations.delete(sessionId);
+  }
+};
 
 /**
  * Test-only helper to reset the module-level error-path state between cases.
@@ -125,7 +187,7 @@ export const registerTriggerUrlElicitationTool = (server: McpServer) => {
         // the session, the requested URL, and the caller-supplied elicitationId
         // (if any). Keying on the resolved/random elicitationId would change on
         // every call and never match, re-throwing the prerequisite forever.
-        const errorPathKey = `${sessionId}\u0000${url}\u0000${requestedElicitationId ?? ""}`;
+        const errorPathKey = errorPathDigest(url, requestedElicitationId);
 
         const elicitationParams: ElicitRequestURLParams = {
           mode: "url",
@@ -146,15 +208,13 @@ export const registerTriggerUrlElicitationTool = (server: McpServer) => {
         //     the retry, *ignore* errorPath, and fall through to the request
         //     path. Without this, the retry would re-enter the error path and
         //     re-request the prerequisite URL — another loop.
+        // A retry of a satisfied prerequisite consumes the one-shot marker and
+        // falls through to the request path below.
         if (errorPath) {
-          if (issuedErrorPathElicitations.has(errorPathKey)) {
-            // Retry of a satisfied prerequisite: clear the one-shot marker and
-            // ignore errorPath, falling through to the request path below.
-            issuedErrorPathElicitations.delete(errorPathKey);
-          } else {
+          if (!consumeErrorPathKey(sessionId, errorPathKey)) {
             // Originating call: record that we issued a prerequisite for this
             // request, then signal the client via -32042.
-            issuedErrorPathElicitations.add(errorPathKey);
+            recordErrorPathKey(sessionId, errorPathKey);
             const prerequisiteElicitation: ElicitRequestURLParams = {
               mode: "url",
               url: "https://modelcontextprotocol.io",
