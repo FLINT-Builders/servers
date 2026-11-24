@@ -200,5 +200,6 @@ src/everything
   - On server disconnect, calls `cleanup()` to remove any live intervals.
 - `streamableHttp.ts`
   - Express server exposing a single `/mcp` endpoint for POST (JSON‑RPC), GET (SSE stream), and DELETE (session termination) using `StreamableHTTPServerTransport`.
-  - Uses an `InMemoryEventStore` for resumable sessions and tracks transports by `sessionId`.
+  - Uses an `InMemoryEventStore` for resumable sessions and tracks transports by `sessionId`. The store keeps at most 32 events per session, skips messages over 64 KiB, evicts the oldest events once all sessions together hold 8 MiB, and drops a session's events when it closes.
+  - Accepts at most 100 concurrent sessions (further initialization requests get a 503) and closes sessions that have no open requests for 30 minutes.
   - Connects a fresh server instance on initialization POST and reuses the transport for subsequent requests.
