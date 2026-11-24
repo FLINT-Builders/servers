@@ -4,6 +4,10 @@ import {
 } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express, { Request, Response } from "express";
 import { createServer } from "../server/index.js";
+import {
+  boundedJsonBody,
+  MAX_REQUEST_BODY_BYTES,
+} from "../server/request-limits.js";
 import { randomUUID } from "node:crypto";
 import cors from "cors";
 
@@ -57,7 +61,7 @@ const transports: Map<string, StreamableHTTPServerTransport> = new Map<
 >();
 
 // Handle POST requests for client messages
-app.post("/mcp", async (req: Request, res: Response) => {
+app.post("/mcp", boundedJsonBody, async (req: Request, res: Response) => {
   console.log("Received MCP POST request");
   try {
     // Check for existing session ID
@@ -76,6 +80,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         eventStore, // Enable resumability
+        maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
         onsessioninitialized: (sessionId: string) => {
           // Store the transport by session ID when a session is initialized
           // This avoids race conditions where requests might come in before the session is stored
@@ -99,7 +104,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
       // Connect the transport to the MCP server BEFORE handling the request
       // so responses can flow back through the same transport
       await server.connect(transport);
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req, res, req.body);
       return;
     } else {
       // Invalid request - no session ID or not initialization request
@@ -116,7 +121,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
     // Handle the request with existing transport - no need to reconnect
     // The existing transport is already connected to the server
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.log("Error handling MCP request:", error);
     if (!res.headersSent) {
