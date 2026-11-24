@@ -32,14 +32,25 @@ export function convertToWindowsPath(p: string): string {
 }
 
 /**
- * Normalizes path by standardizing format while preserving OS-specific behavior
+ * Normalizes path by standardizing format while preserving OS-specific behavior.
+ * Also strips surrounding quotes and whitespace, so it is only suitable for
+ * trusted configuration input such as allowed directories.
  * @param p The path to normalize
  * @returns Normalized path
  */
 export function normalizePath(p: string): string {
   // Remove any surrounding quotes and whitespace
-  p = p.trim().replace(/^["']|["']$/g, '');
+  return normalizePathFormat(p.trim().replace(/^["']|["']$/g, ''));
+}
 
+/**
+ * Normalizes separators, drive letters and `.`/`..` segments without removing
+ * any characters from the path. Use this for paths that are subsequently
+ * passed to filesystem calls, so the normalized form names the same file.
+ * @param p The path to normalize
+ * @returns Normalized path
+ */
+export function normalizePathFormat(p: string): string {
   // Check if this is a Unix path that should not be converted
   // WSL paths (/mnt/) should ALWAYS be preserved as they work correctly in WSL with Node.js fs
   // Regular Unix paths should also be preserved
