@@ -22,4 +22,8 @@ ENV NODE_ENV=production
 
 RUN npm ci --ignore-scripts --omit-dev
 
+# Never run as root: files written to host bind mounts get this uid/gid.
+# Numeric so runtimes that enforce non-root (e.g. runAsNonRoot) can verify it.
+USER 1000:1000
+
 ENTRYPOINT ["node", "/app/dist/index.js"]
