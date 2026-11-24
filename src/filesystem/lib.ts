@@ -111,24 +111,37 @@ async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<strin
 
   for (let index = 0; index < relativeParts.length; index++) {
     const requestedPart = relativeParts[index];
-    const entries = (await fs.readdir(currentPath)) ?? [];
-    const exactMatch = entries.find(entry => entry === requestedPart);
-    const equivalentMatches = exactMatch
-      ? [exactMatch]
-      : entries.filter(entry => entry.normalize('NFC') === requestedPart.normalize('NFC'));
+    // Ask the OS first so its own name matching applies (case folding on
+    // macOS/Windows, trailing dots and short names on Windows, normalization
+    // on APFS). A directory listing compared as strings cannot see that a
+    // differently spelled name resolves to an existing entry such as a symlink.
+    let nextPath = path.join(currentPath, requestedPart);
+    try {
+      await fs.lstat(nextPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
 
-    if (equivalentMatches.length > 1) {
-      throw new Error(`Ambiguous Unicode path component: ${requestedPart}`);
+      const entries = (await fs.readdir(currentPath)) ?? [];
+      const equivalentMatches = entries.filter(entry => entry.normalize('NFC') === requestedPart.normalize('NFC'));
+
+      if (equivalentMatches.length > 1) {
+        throw new Error(`Ambiguous Unicode path component: ${requestedPart}`);
+      }
+
+      if (equivalentMatches.length === 0) {
+        // The OS reports that nothing by this name exists, so there are no
+        // symlinks left to resolve. currentPath is already realpath'd and inside
+        // an allowed directory; append the missing tail so create_directory can
+        // mkdir -p it.
+        return path.join(currentPath, ...relativeParts.slice(index));
+      }
+
+      nextPath = path.join(currentPath, equivalentMatches[0]);
     }
 
-    if (equivalentMatches.length === 0) {
-      // Nothing below this point exists yet, so there are no symlinks left to
-      // resolve. currentPath is already realpath'd and inside an allowed
-      // directory; append the missing tail so create_directory can mkdir -p it.
-      return path.join(currentPath, ...relativeParts.slice(index));
-    }
-
-    currentPath = await fs.realpath(path.join(currentPath, equivalentMatches[0]));
+    currentPath = await fs.realpath(nextPath);
     if (!isPathWithinAllowedDirectories(normalizePath(currentPath), allowedDirectories)) {
       throw new Error(`Access denied - symlink target outside allowed directories: ${currentPath} not in ${allowedDirectories.join(', ')}`);
     }
