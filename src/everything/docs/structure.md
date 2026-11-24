@@ -35,6 +35,7 @@ src/everything
      ├── server
      │   ├── index.ts
      │   ├── logging.ts
+     │   ├── request-limits.ts
      │   └── roots.ts
      ├── tools
      │   ├── index.ts
@@ -135,6 +136,9 @@ src/everything
   - Exposes `{ server, cleanup }` to the chosen transport. Cleanup stops any running intervals in the server when the transport disconnects.
 - `logging.ts`
   - Implements simulated logging. Periodically sends randomized log messages at various levels to the connected client session. Started/stopped on demand via a dedicated tool.
+- `request-limits.ts`
+  - Bounds on client input: request body size and the combined number of array elements and object members in one message.
+  - Exports `boundedJsonBody`, the Express middleware the HTTP transports run before handing a POST body to the SDK, and the element bound passed to `McpServer` as `maxToolInputElements`.
 
 ### `tools/`
 

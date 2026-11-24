@@ -1,6 +1,7 @@
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import { createServer } from "../server/index.js";
+import { boundedJsonBody } from "../server/request-limits.js";
 import cors from "cors";
 
 console.error("Starting SSE server...");
@@ -56,7 +57,7 @@ app.get("/sse", async (req, res) => {
 });
 
 // Handle POST requests for client messages
-app.post("/message", async (req, res) => {
+app.post("/message", boundedJsonBody, async (req, res) => {
   // Session Id should exist for POST /message requests
   const sessionId = req?.query?.sessionId as string;
 
@@ -64,7 +65,7 @@ app.post("/message", async (req, res) => {
   const transport = transports.get(sessionId);
   if (transport) {
     console.error("Client Message from", sessionId);
-    await transport.handlePostMessage(req, res);
+    await transport.handlePostMessage(req, res, req.body);
   } else {
     console.error(`No transport found for sessionId ${sessionId}`);
   }

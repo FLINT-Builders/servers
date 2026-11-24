@@ -12,6 +12,7 @@ import { registerResources, readInstructions } from "../resources/index.js";
 import { registerPrompts } from "../prompts/index.js";
 import { stopSimulatedLogging } from "./logging.js";
 import { syncRoots } from "./roots.js";
+import { MAX_REQUEST_ELEMENTS } from "./request-limits.js";
 
 // Server Factory response
 export type ServerFactoryResponse = {
@@ -75,6 +76,7 @@ export const createServer: () => ServerFactoryResponse = () => {
       instructions,
       taskStore,
       taskMessageQueue,
+      maxToolInputElements: MAX_REQUEST_ELEMENTS,
     }
   );
 
