@@ -7,7 +7,6 @@ import {
   type Root,
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
 import path from "path";
 import { pathToFileURL } from "url";
 import { z } from "zod";
@@ -168,24 +167,6 @@ const server = new McpServer(
   }
 );
 
-// Reads a file as a stream of buffers, concatenates them, and then encodes
-// the result to a Base64 string. This is a memory-efficient way to handle
-// binary data from a stream before the final encoding.
-async function readFileAsBase64Stream(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath);
-    const chunks: Buffer[] = [];
-    stream.on('data', (chunk) => {
-      chunks.push(chunk as Buffer);
-    });
-    stream.on('end', () => {
-      const finalBuffer = Buffer.concat(chunks);
-      resolve(finalBuffer.toString('base64'));
-    });
-    stream.on('error', (err) => reject(err));
-  });
-}
-
 // Tool registrations
 
 // read_file (deprecated) and read_text_file
@@ -294,7 +275,7 @@ server.registerTool(
       ".flac": "audio/flac",
     };
     const mimeType = mimeTypes[extension] || "application/octet-stream";
-    const data = await readFileAsBase64Stream(validPath);
+    const data = await readFileContent(validPath, 'base64');
 
     // Map the MIME type to a valid MCP content block. The spec only allows
     // text, image, audio, resource_link, and resource — so non-image/audio

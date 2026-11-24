@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { constants as fsConstants } from 'fs';
 import {
   // Pure utility functions
   formatSize,
@@ -29,6 +30,8 @@ const mockFs = fs as any;
 
 function createMockFileHandle(content: Buffer) {
   return {
+    fd: 3,
+    stat: vi.fn().mockResolvedValue({ size: content.length }),
     read: vi.fn(
       async (buffer: Buffer, offset: number, length: number, position: number) => {
         const bytesRead = content.copy(
@@ -44,12 +47,33 @@ function createMockFileHandle(content: Buffer) {
   };
 }
 
+// Handles returned by fs.open: 'wx' opens the temp file for an atomic
+// replace, any other flags open the validated file for reading.
+function mockOpenHandles({ content = '', mode = 0o100644 }: { content?: string; mode?: number } = {}) {
+  const readHandle = {
+    fd: 3,
+    readFile: vi.fn().mockResolvedValue(content),
+    stat: vi.fn().mockResolvedValue({ mode, size: Buffer.byteLength(content) }),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
+  const tempHandle = {
+    fd: 4,
+    writeFile: vi.fn().mockResolvedValue(undefined),
+    chmod: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
+  mockFs.open.mockImplementation(async (_path: string, flags: unknown) => (flags === 'wx' ? tempHandle : readHandle));
+  return { readHandle, tempHandle };
+}
+
 describe('Lib Functions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Set up allowed directories for tests
     const allowedDirs = process.platform === 'win32' ? ['C:\\Users\\test', 'C:\\temp', 'C:\\allowed'] : ['/home/user', '/tmp', '/allowed'];
     setAllowedDirectories(allowedDirs);
+    // On Linux the opened descriptor's location is read from /proc/self/fd.
+    mockFs.readlink.mockResolvedValue(path.join(allowedDirs[0], 'file.txt'));
   });
 
   afterEach(() => {
@@ -286,7 +310,7 @@ describe('Lib Functions', () => {
           mode: 0o644
         };
         
-        mockFs.stat.mockResolvedValueOnce(mockStats as any);
+        mockFs.lstat.mockResolvedValueOnce(mockStats as any);
         
         const result = await getFileStats('/test/file.txt');
         
@@ -312,7 +336,7 @@ describe('Lib Functions', () => {
           mode: 0o755
         };
         
-        mockFs.stat.mockResolvedValueOnce(mockStats as any);
+        mockFs.lstat.mockResolvedValueOnce(mockStats as any);
         
         const result = await getFileStats('/test/dir');
         
@@ -324,21 +348,44 @@ describe('Lib Functions', () => {
 
     describe('readFileContent', () => {
       it('reads file with default encoding', async () => {
-        mockFs.readFile.mockResolvedValueOnce('file content');
+        const { readHandle } = mockOpenHandles({ content: 'file content' });
         
         const result = await readFileContent('/test/file.txt');
         
         expect(result).toBe('file content');
-        expect(mockFs.readFile).toHaveBeenCalledWith('/test/file.txt', 'utf-8');
+        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', expect.any(Number));
+        expect(readHandle.readFile).toHaveBeenCalledWith('utf-8');
+        expect(readHandle.close).toHaveBeenCalled();
       });
 
       it('reads file with custom encoding', async () => {
-        mockFs.readFile.mockResolvedValueOnce('file content');
+        const { readHandle } = mockOpenHandles({ content: 'file content' });
         
         const result = await readFileContent('/test/file.txt', 'ascii');
         
         expect(result).toBe('file content');
-        expect(mockFs.readFile).toHaveBeenCalledWith('/test/file.txt', 'ascii');
+        expect(readHandle.readFile).toHaveBeenCalledWith('ascii');
+      });
+
+      it('opens without following a symlink at the final component', async () => {
+        mockOpenHandles({ content: 'file content' });
+
+        await readFileContent('/test/file.txt');
+
+        const flags = mockFs.open.mock.calls[0][1] as number;
+        if (fsConstants.O_NOFOLLOW !== undefined) {
+          expect(flags & fsConstants.O_NOFOLLOW).toBe(fsConstants.O_NOFOLLOW);
+        }
+      });
+
+      it.skipIf(process.platform !== 'linux')('refuses a descriptor that resolves outside the allowed directories', async () => {
+        const { readHandle } = mockOpenHandles({ content: 'outside content' });
+        mockFs.readlink.mockResolvedValueOnce('/etc/outside.txt');
+
+        await expect(readFileContent('/allowed/file.txt')).rejects.toThrow(/outside allowed directories/);
+        expect(mockFs.readlink).toHaveBeenCalledWith('/proc/self/fd/3');
+        expect(readHandle.readFile).not.toHaveBeenCalled();
+        expect(readHandle.close).toHaveBeenCalled();
       });
     });
 
@@ -354,25 +401,29 @@ describe('Lib Functions', () => {
       it('preserves file permissions when overwriting existing file', async () => {
         // First writeFile call with 'wx' flag fails because file exists
         mockFs.writeFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST'), { code: 'EEXIST' }));
-        // stat returns executable permissions
-        mockFs.stat.mockResolvedValueOnce({ mode: 0o100755 });
-        // Second writeFile (to temp) succeeds
-        mockFs.writeFile.mockResolvedValueOnce(undefined);
+        // lstat returns executable permissions
+        mockFs.lstat.mockResolvedValueOnce({ mode: 0o100755, isFile: () => true });
+        const { tempHandle } = mockOpenHandles();
         mockFs.rename.mockResolvedValueOnce(undefined);
-        mockFs.chmod.mockResolvedValueOnce(undefined);
 
         await writeFileContent('/test/script.sh', 'new content');
 
-        expect(mockFs.stat).toHaveBeenCalledWith('/test/script.sh');
-        expect(mockFs.chmod).toHaveBeenCalledWith('/test/script.sh', 0o755);
+        expect(mockFs.lstat).toHaveBeenCalledWith('/test/script.sh');
+        expect(tempHandle.writeFile).toHaveBeenCalledWith('new content', 'utf-8');
+        expect(tempHandle.chmod).toHaveBeenCalledWith(0o755);
+        expect(mockFs.chmod).not.toHaveBeenCalled();
+        expect(mockFs.rename).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/script\.sh\.[a-f0-9]+\.tmp$/),
+          '/test/script.sh'
+        );
       });
 
       it('does not fail the write when chmod fails', async () => {
         mockFs.writeFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST'), { code: 'EEXIST' }));
-        mockFs.stat.mockResolvedValueOnce({ mode: 0o100755 });
-        mockFs.writeFile.mockResolvedValueOnce(undefined);
+        mockFs.lstat.mockResolvedValueOnce({ mode: 0o100755, isFile: () => true });
+        const { tempHandle } = mockOpenHandles();
+        tempHandle.chmod.mockRejectedValueOnce(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
         mockFs.rename.mockResolvedValueOnce(undefined);
-        mockFs.chmod.mockRejectedValueOnce(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
 
         await expect(writeFileContent('/test/script.sh', 'new content')).resolves.toBeUndefined();
         expect(mockFs.unlink).not.toHaveBeenCalled();
@@ -505,11 +556,10 @@ describe('Lib Functions', () => {
 
   describe('File Editing Functions', () => {
     describe('applyFileEdits', () => {
+      let handles: ReturnType<typeof mockOpenHandles>;
+
       beforeEach(() => {
-        mockFs.readFile.mockResolvedValue('line1\nline2\nline3\n');
-        mockFs.writeFile.mockResolvedValue(undefined);
-        mockFs.stat.mockResolvedValue({ mode: 0o100644 });
-        mockFs.chmod.mockResolvedValue(undefined);
+        handles = mockOpenHandles({ content: 'line1\nline2\nline3\n' });
       });
 
       it('applies simple text replacement', async () => {
@@ -523,8 +573,11 @@ describe('Lib Functions', () => {
         
         expect(result).toContain('modified line2');
         // Should write to temporary file then rename
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           'line1\nmodified line2\nline3\n',
           'utf-8'
         );
@@ -543,8 +596,11 @@ describe('Lib Functions', () => {
 
         await applyFileEdits('/test/file.txt', edits, false);
 
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           "line1\nprice=$$; match=$&; before=$`; after=$'\nline3\n",
           'utf-8'
         );
@@ -558,7 +614,8 @@ describe('Lib Functions', () => {
         const result = await applyFileEdits('/test/file.txt', edits, true);
         
         expect(result).toContain('modified line2');
-        expect(mockFs.writeFile).not.toHaveBeenCalled();
+        expect(handles.tempHandle.writeFile).not.toHaveBeenCalled();
+        expect(mockFs.rename).not.toHaveBeenCalled();
       });
 
       it('applies multiple edits sequentially', async () => {
@@ -571,8 +628,11 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.txt', edits, false);
         
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           'first line\nline2\nthird line\n',
           'utf-8'
         );
@@ -583,7 +643,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles whitespace-flexible matching', async () => {
-        mockFs.readFile.mockResolvedValue('  line1\n    line2\n  line3\n');
+        handles.readHandle.readFile.mockResolvedValue('  line1\n    line2\n  line3\n');
         
         const edits = [
           { oldText: 'line2', newText: 'modified line2' }
@@ -593,8 +653,11 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.txt', edits, false);
         
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           '  line1\n    modified line2\n  line3\n',
           'utf-8'
         );
@@ -605,7 +668,7 @@ describe('Lib Functions', () => {
       });
 
       it('preserves file permissions after applying edits', async () => {
-        mockFs.stat.mockResolvedValue({ mode: 0o100755 });
+        handles.readHandle.stat.mockResolvedValue({ mode: 0o100755 });
         const edits = [
           { oldText: 'line2', newText: 'modified line2' }
         ];
@@ -614,8 +677,9 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/script.sh', edits, false);
         
-        expect(mockFs.stat).toHaveBeenCalledWith('/test/script.sh');
-        expect(mockFs.chmod).toHaveBeenCalledWith('/test/script.sh', 0o755);
+        expect(handles.readHandle.stat).toHaveBeenCalled();
+        expect(handles.tempHandle.chmod).toHaveBeenCalledWith(0o755);
+        expect(mockFs.chmod).not.toHaveBeenCalled();
       });
 
       it('does not restore permissions in dry run mode', async () => {
@@ -625,7 +689,7 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.txt', edits, true);
         
-        expect(mockFs.chmod).not.toHaveBeenCalled();
+        expect(handles.tempHandle.chmod).not.toHaveBeenCalled();
       });
 
       it('throws error for non-matching edits', async () => {
@@ -638,7 +702,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles complex multi-line edits with indentation', async () => {
-        mockFs.readFile.mockResolvedValue('function test() {\n  console.log("hello");\n  return true;\n}');
+        handles.readHandle.readFile.mockResolvedValue('function test() {\n  console.log("hello");\n  return true;\n}');
         
         const edits = [
           { 
@@ -651,8 +715,11 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.js', edits, false);
         
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           'function test() {\n  console.log("world");\n  console.log("test");\n  return false;\n}',
           'utf-8'
         );
@@ -663,7 +730,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles edits with different indentation patterns', async () => {
-        mockFs.readFile.mockResolvedValue('    if (condition) {\n        doSomething();\n    }');
+        handles.readHandle.readFile.mockResolvedValue('    if (condition) {\n        doSomething();\n    }');
         
         const edits = [
           { 
@@ -676,8 +743,11 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.js', edits, false);
         
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           '    if (condition) {\n        doSomethingElse();\n        doAnotherThing();\n    }',
           'utf-8'
         );
@@ -688,7 +758,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles CRLF line endings in file content', async () => {
-        mockFs.readFile.mockResolvedValue('line1\r\nline2\r\nline3\r\n');
+        handles.readHandle.readFile.mockResolvedValue('line1\r\nline2\r\nline3\r\n');
         
         const edits = [
           { oldText: 'line2', newText: 'modified line2' }
@@ -698,8 +768,11 @@ describe('Lib Functions', () => {
         
         await applyFileEdits('/test/file.txt', edits, false);
         
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
+        expect(mockFs.open).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'wx'
+        );
+        expect(handles.tempHandle.writeFile).toHaveBeenCalledWith(
           'line1\nmodified line2\nline3\n',
           'utf-8'
         );
@@ -712,19 +785,20 @@ describe('Lib Functions', () => {
 
     describe('tailFile', () => {
       it('handles empty files', async () => {
-        mockFs.stat.mockResolvedValue({ size: 0 } as any);
+        const mockFileHandle = createMockFileHandle(Buffer.alloc(0));
+        mockFs.open.mockResolvedValue(mockFileHandle);
         
         const result = await tailFile('/test/empty.txt', 5);
         
         expect(result).toBe('');
-        expect(mockFs.open).not.toHaveBeenCalled();
+        expect(mockFileHandle.read).not.toHaveBeenCalled();
+        expect(mockFileHandle.close).toHaveBeenCalled();
       });
 
-      it('calls stat to check file size', async () => {
-        mockFs.stat.mockResolvedValue({ size: 100 } as any);
-        
-        // Mock file handle with proper typing
+      it('stats the opened handle to check file size', async () => {
         const mockFileHandle = {
+          fd: 3,
+          stat: vi.fn().mockResolvedValue({ size: 100 }),
           read: vi.fn(),
           close: vi.fn()
         } as any;
@@ -736,14 +810,14 @@ describe('Lib Functions', () => {
         
         await tailFile('/test/file.txt', 2);
         
-        expect(mockFs.stat).toHaveBeenCalledWith('/test/file.txt');
-        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
+        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', expect.any(Number));
+        expect(mockFileHandle.stat).toHaveBeenCalled();
       });
 
       it('handles files with content and returns last lines', async () => {
-        mockFs.stat.mockResolvedValue({ size: 50 } as any);
-        
         const mockFileHandle = {
+          fd: 3,
+          stat: vi.fn().mockResolvedValue({ size: 50 }),
           read: vi.fn(),
           close: vi.fn()
         } as any;
@@ -770,7 +844,6 @@ describe('Lib Functions', () => {
         ]);
         const mockFileHandle = createMockFileHandle(content);
 
-        mockFs.stat.mockResolvedValue({ size: content.length } as any);
         mockFs.open.mockResolvedValue(mockFileHandle);
 
         const result = await tailFile('/test/file.txt', 2);
@@ -779,9 +852,9 @@ describe('Lib Functions', () => {
       });
 
       it('handles read errors gracefully', async () => {
-        mockFs.stat.mockResolvedValue({ size: 100 } as any);
-        
         const mockFileHandle = {
+          fd: 3,
+          stat: vi.fn().mockResolvedValue({ size: 100 }),
           read: vi.fn(),
           close: vi.fn()
         } as any;
@@ -812,7 +885,7 @@ describe('Lib Functions', () => {
         
         await headFile('/test/file.txt', 2);
         
-        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
+        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', expect.any(Number));
       });
 
       it('handles files with content and returns first lines', async () => {
