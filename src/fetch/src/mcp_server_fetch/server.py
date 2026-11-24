@@ -1,6 +1,10 @@
-from typing import Annotated, Tuple
+import codecs
+import zlib
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Annotated, AsyncIterator, Tuple
 from urllib.parse import urlparse, urlunparse
 
+import anyio
 import markdownify
 import readabilipy.simple_json
 from mcp.shared.exceptions import McpError
@@ -20,8 +24,155 @@ from mcp.types import (
 from protego import Protego
 from pydantic import BaseModel, Field, AnyUrl
 
+if TYPE_CHECKING:
+    from httpx import AsyncClient, Response
+
 DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
 DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
+
+# Upper bound on the decoded body read from any single response. The tool
+# never returns more than 999_999 characters, so this leaves ample room for
+# HTML that is simplified to markdown while keeping memory use bounded.
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+# Crawlers such as Google ignore robots.txt content past 500 KiB.
+MAX_ROBOTS_TXT_BYTES = 512 * 1024
+# httpx timeouts apply to each socket operation, so a server that keeps
+# trickling bytes never trips them. This bounds the whole request instead.
+REQUEST_DEADLINE_SECONDS = 30
+# Only codings that can be decoded with a bounded output size are advertised.
+ACCEPT_ENCODING = "gzip, deflate"
+MAX_CONTENT_CODINGS = 2
+_DECODE_STEP_BYTES = 64 * 1024
+
+
+class _BoundedZlibDecoder:
+    """Decoder for one gzip or deflate content coding that limits output per call."""
+
+    def __init__(self, coding: str) -> None:
+        self._is_deflate = coding == "deflate"
+        self._first_attempt = True
+        self._decompressor = zlib.decompressobj(
+            zlib.MAX_WBITS if self._is_deflate else zlib.MAX_WBITS | 16
+        )
+        self.produced = 0
+
+    @property
+    def eof(self) -> bool:
+        return self._decompressor.eof
+
+    def decompress(self, data: bytes, max_length: int) -> Tuple[bytes, bytes]:
+        """Return up to ``max_length`` decoded bytes and the input not yet consumed."""
+        from httpx import DecodingError
+
+        if self._decompressor.eof:
+            # Anything after the end of the stream is ignored, as httpx does.
+            return b"", b""
+        was_first_attempt = self._first_attempt
+        self._first_attempt = False
+        try:
+            output = self._decompressor.decompress(data, max_length)
+        except zlib.error as exc:
+            # Some servers send raw deflate without the zlib wrapper.
+            if not (self._is_deflate and was_first_attempt):
+                raise DecodingError(str(exc)) from exc
+            self._decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+            try:
+                output = self._decompressor.decompress(data, max_length)
+            except zlib.error as exc2:
+                raise DecodingError(str(exc2)) from exc2
+        self.produced += len(output)
+        return output, self._decompressor.unconsumed_tail
+
+
+class _BoundedBody:
+    """Accumulates a response body, decoding content codings, up to ``limit`` bytes."""
+
+    def __init__(self, content_codings: list[str], limit: int) -> None:
+        from httpx import DecodingError
+
+        codings = [
+            coding
+            for coding in (value.strip().lower() for value in content_codings)
+            if coding in ("gzip", "deflate")
+        ]
+        if len(codings) > MAX_CONTENT_CODINGS:
+            raise DecodingError(f"Too many content codings: {', '.join(codings)}")
+        # Codings are listed in the order they were applied.
+        self._decoders = [_BoundedZlibDecoder(coding) for coding in reversed(codings)]
+        self._limit = limit
+        self.data = bytearray()
+        self.truncated = False
+
+    def feed(self, chunk: bytes) -> bool:
+        """Consume a raw body chunk. Return False once no more input is wanted."""
+        if not chunk:
+            return True
+        if not self._push(0, chunk):
+            return False
+        return not any(decoder.eof for decoder in self._decoders)
+
+    def _push(self, index: int, data: bytes) -> bool:
+        if index == len(self._decoders):
+            return self._append(data)
+        decoder = self._decoders[index]
+        while True:
+            output, data = decoder.decompress(data, _DECODE_STEP_BYTES)
+            if output and not self._push(index + 1, output):
+                return False
+            if decoder.produced > self._limit:
+                self.truncated = True
+                return False
+            if not data and len(output) < _DECODE_STEP_BYTES:
+                return True
+
+    def _append(self, data: bytes) -> bool:
+        room = self._limit - len(self.data)
+        if len(data) > room:
+            self.data += data[:room]
+            self.truncated = True
+            return False
+        self.data += data
+        return True
+
+
+@asynccontextmanager
+async def _open_response(
+    client: "AsyncClient", url: str, user_agent: str, timeout: float | None = None
+) -> AsyncIterator["Response"]:
+    """Send a GET request, following redirects without reading their bodies."""
+    from httpx import TooManyRedirects
+
+    headers = {"User-Agent": user_agent, "Accept-Encoding": ACCEPT_ENCODING}
+    if timeout is None:
+        request = client.build_request("GET", url, headers=headers)
+    else:
+        request = client.build_request("GET", url, headers=headers, timeout=timeout)
+    redirects = 0
+    while True:
+        response = await client.send(request, stream=True, follow_redirects=False)
+        next_request = response.next_request
+        if next_request is None:
+            break
+        await response.aclose()
+        redirects += 1
+        if redirects > client.max_redirects:
+            raise TooManyRedirects("Exceeded maximum allowed redirects.", request=next_request)
+        request = next_request
+    try:
+        yield response
+    finally:
+        await response.aclose()
+
+
+async def _read_text(response: "Response", limit: int) -> Tuple[str, bool]:
+    """Read at most ``limit`` decoded body bytes. Return the text and whether it was truncated."""
+    body = _BoundedBody(response.headers.get_list("content-encoding", split_commas=True), limit)
+    async for chunk in response.aiter_raw():
+        if not body.feed(chunk):
+            break
+    decoder = codecs.getincrementaldecoder(response.encoding or "utf-8")(errors="replace")
+    # A truncated body may end inside a multi-byte character; drop it.
+    return decoder.decode(body.data, final=not body.truncated), body.truncated
 
 
 def extract_content_from_html(html: str) -> str:
@@ -74,24 +225,24 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url:
 
     async with AsyncClient(proxy=proxy_url) as client:
         try:
-            response = await client.get(
-                robot_txt_url,
-                follow_redirects=True,
-                headers={"User-Agent": user_agent},
-            )
-        except HTTPError:
+            with anyio.fail_after(REQUEST_DEADLINE_SECONDS):
+                async with _open_response(client, robot_txt_url, user_agent) as response:
+                    if response.status_code in (401, 403):
+                        raise McpError(ErrorData(
+                            code=INTERNAL_ERROR,
+                            message=f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt",
+                        ))
+                    elif 400 <= response.status_code < 500:
+                        return
+                    robot_txt, truncated = await _read_text(response, MAX_ROBOTS_TXT_BYTES)
+        except (HTTPError, TimeoutError):
             raise McpError(ErrorData(
                 code=INTERNAL_ERROR,
                 message=f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue",
             ))
-        if response.status_code in (401, 403):
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt",
-            ))
-        elif 400 <= response.status_code < 500:
-            return
-        robot_txt = response.text
+    if truncated:
+        # Drop the partial last line so a cut-off rule is not misread.
+        robot_txt = robot_txt[: robot_txt.rfind("\n") + 1]
     processed_robot_txt = "\n".join(
         line for line in robot_txt.splitlines() if not line.strip().startswith("#")
     )
@@ -118,33 +269,40 @@ async def fetch_url(
 
     async with AsyncClient(proxy=proxy_url) as client:
         try:
-            response = await client.get(
-                url,
-                follow_redirects=True,
-                headers={"User-Agent": user_agent},
-                timeout=30,
-            )
+            with anyio.fail_after(REQUEST_DEADLINE_SECONDS):
+                async with _open_response(
+                    client, url, user_agent, timeout=REQUEST_DEADLINE_SECONDS
+                ) as response:
+                    if response.status_code >= 400:
+                        raise McpError(ErrorData(
+                            code=INTERNAL_ERROR,
+                            message=f"Failed to fetch {url} - status code {response.status_code}",
+                        ))
+                    page_raw, truncated = await _read_text(response, MAX_RESPONSE_BYTES)
         except HTTPError as e:
             raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
-        if response.status_code >= 400:
+        except TimeoutError:
             raise McpError(ErrorData(
                 code=INTERNAL_ERROR,
-                message=f"Failed to fetch {url} - status code {response.status_code}",
+                message=f"Failed to fetch {url}: no complete response within {REQUEST_DEADLINE_SECONDS} seconds",
             ))
 
-        page_raw = response.text
-
+    notice = (
+        f"The response was larger than {MAX_RESPONSE_BYTES} bytes, so only the first {MAX_RESPONSE_BYTES} bytes were read.\n"
+        if truncated
+        else ""
+    )
     content_type = response.headers.get("content-type", "")
     is_page_html = (
         "<html" in page_raw[:100] or "text/html" in content_type or not content_type
     )
 
     if is_page_html and not force_raw:
-        return extract_content_from_html(page_raw), ""
+        return extract_content_from_html(page_raw), notice
 
     return (
         page_raw,
-        f"Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n",
+        f"{notice}Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n",
     )
 
 
