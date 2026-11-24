@@ -1,4 +1,5 @@
-import fs from "fs/promises";
+import fs, { type FileHandle } from "fs/promises";
+import { constants as fsConstants } from "fs";
 import path from "path";
 import os from 'os';
 import { randomBytes } from 'crypto';
@@ -184,9 +185,51 @@ export async function validatePath(requestedPath: string): Promise<string> {
 }
 
 
+// macOS 11+ fails the open if any component of the path is a symlink.
+const O_NOFOLLOW_ANY = 0x20000000;
+
+function readOpenFlags(): number {
+  let flags = fsConstants.O_RDONLY;
+  if (fsConstants.O_NOFOLLOW !== undefined) {
+    flags |= fsConstants.O_NOFOLLOW;
+  }
+  if (process.platform === 'darwin') {
+    flags |= O_NOFOLLOW_ANY;
+  }
+  return flags;
+}
+
+async function assertOpenedWithinAllowedDirectories(handle: FileHandle, filePath: string): Promise<void> {
+  if (process.platform !== 'linux') {
+    return;
+  }
+  // The kernel reports where the descriptor actually points, including after a
+  // parent directory was swapped for a symlink between validation and open.
+  const openedPath = await fs.readlink(`/proc/self/fd/${handle.fd}`);
+  if (!isPathWithinAllowedDirectories(openedPath, allowedDirectories)) {
+    throw new Error(`Access denied - opened file is outside allowed directories: ${filePath}`);
+  }
+}
+
+/**
+ * Opens a path returned by validatePath for reading. Callers must read through
+ * the returned handle rather than reopening the path, since the name may be
+ * replaced by a symlink after validation.
+ */
+export async function openFileForReading(filePath: string): Promise<FileHandle> {
+  const handle = await fs.open(filePath, readOpenFlags());
+  try {
+    await assertOpenedWithinAllowedDirectories(handle, filePath);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
 // File Operations
 export async function getFileStats(filePath: string): Promise<FileInfo> {
-  const stats = await fs.stat(filePath);
+  const stats = await fs.lstat(filePath);
   return {
     size: stats.size,
     created: stats.birthtime,
@@ -199,7 +242,43 @@ export async function getFileStats(filePath: string): Promise<FileInfo> {
 }
 
 export async function readFileContent(filePath: string, encoding: string = 'utf-8'): Promise<string> {
-  return await fs.readFile(filePath, encoding as BufferEncoding);
+  const handle = await openFileForReading(filePath);
+  try {
+    return await handle.readFile(encoding as BufferEncoding);
+  } finally {
+    await handle.close();
+  }
+}
+
+// Security: Use atomic rename to prevent race conditions where symlinks
+// could be created between validation and write. Rename operations
+// replace the target file atomically and don't follow symlinks.
+async function replaceFileAtomically(filePath: string, content: string, mode?: number): Promise<void> {
+  const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
+  const tempHandle = await fs.open(tempPath, 'wx');
+  try {
+    try {
+      await tempHandle.writeFile(content, 'utf-8');
+      // Restore original permission bits since the atomic rename replaces the
+      // inode and the temp file has default (0644) permissions. This is done
+      // on the temp file's descriptor: a chmod by name after the rename would
+      // follow a symlink swapped into its place. A chmod failure must not
+      // fail the write.
+      if (mode !== undefined) {
+        try {
+          await tempHandle.chmod(mode);
+        } catch {}
+      }
+    } finally {
+      await tempHandle.close();
+    }
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {}
+    throw error;
+  }
 }
 
 export async function writeFileContent(filePath: string, content: string): Promise<void> {
@@ -209,27 +288,10 @@ export async function writeFileContent(filePath: string, content: string): Promi
     await fs.writeFile(filePath, content, { encoding: "utf-8", flag: 'wx' });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      // Security: Use atomic rename to prevent race conditions where symlinks
-      // could be created between validation and write. Rename operations
-      // replace the target file atomically and don't follow symlinks.
-      const origStats = await fs.stat(filePath);
-      const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-      try {
-        await fs.writeFile(tempPath, content, 'utf-8');
-        await fs.rename(tempPath, filePath);
-      } catch (renameError) {
-        try {
-          await fs.unlink(tempPath);
-        } catch {}
-        throw renameError;
-      }
-      // Restore original permission bits since the atomic rename replaces the
-      // inode and the temp file has default (0644) permissions. Mask off the
-      // file-type bits; POSIX leaves them unspecified for chmod. A chmod
-      // failure must not fail the write, which has already succeeded.
-      try {
-        await fs.chmod(filePath, origStats.mode & 0o777);
-      } catch {}
+      // Mask off the file-type bits; POSIX leaves them unspecified for chmod.
+      // lstat so a symlink swapped into place does not lend its target's mode.
+      const origStats = await fs.lstat(filePath);
+      await replaceFileAtomically(filePath, content, origStats.isFile() ? origStats.mode & 0o777 : undefined);
     } else {
       throw error;
     }
@@ -268,7 +330,16 @@ export async function applyFileEdits(
   dryRun: boolean = false
 ): Promise<string> {
   // Read file content and normalize line endings
-  const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
+  const handle = await openFileForReading(filePath);
+  let rawContent: string;
+  let originalMode: number;
+  try {
+    rawContent = await handle.readFile('utf-8');
+    originalMode = (await handle.stat()).mode;
+  } finally {
+    await handle.close();
+  }
+  const content = normalizeLineEndings(rawContent);
 
   // Apply edits sequentially
   let modifiedContent = content;
@@ -334,27 +405,8 @@ export async function applyFileEdits(
   const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
 
   if (!dryRun) {
-    // Security: Use atomic rename to prevent race conditions where symlinks
-    // could be created between validation and write. Rename operations
-    // replace the target file atomically and don't follow symlinks.
-    const origStats = await fs.stat(filePath);
-    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-    try {
-      await fs.writeFile(tempPath, modifiedContent, 'utf-8');
-      await fs.rename(tempPath, filePath);
-    } catch (error) {
-      try {
-        await fs.unlink(tempPath);
-      } catch {}
-      throw error;
-    }
-    // Restore original permission bits since the atomic rename replaces the
-    // inode and the temp file has default (0644) permissions. Mask off the
-    // file-type bits; POSIX leaves them unspecified for chmod. A chmod
-    // failure must not fail the write, which has already succeeded.
-    try {
-      await fs.chmod(filePath, origStats.mode & 0o777);
-    } catch {}
+    // Mask off the file-type bits; POSIX leaves them unspecified for chmod.
+    await replaceFileAtomically(filePath, modifiedContent, originalMode & 0o777);
   }
 
   return formattedDiff;
@@ -363,14 +415,13 @@ export async function applyFileEdits(
 // Memory-efficient implementation to get the last N lines of a file
 export async function tailFile(filePath: string, numLines: number): Promise<string> {
   const CHUNK_SIZE = 1024; // Read 1KB at a time
-  const stats = await fs.stat(filePath);
-  const fileSize = stats.size;
-  
-  if (fileSize === 0) return '';
-  
-  // Open file for reading
-  const fileHandle = await fs.open(filePath, 'r');
+  const fileHandle = await openFileForReading(filePath);
   try {
+    const stats = await fileHandle.stat();
+    const fileSize = stats.size;
+
+    if (fileSize === 0) return '';
+
     const chunks: Buffer[] = [];
     let position = fileSize;
     const chunk = Buffer.alloc(CHUNK_SIZE);
@@ -400,7 +451,7 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
 
 // New function to get the first N lines of a file
 export async function headFile(filePath: string, numLines: number): Promise<string> {
-  const fileHandle = await fs.open(filePath, 'r');
+  const fileHandle = await openFileForReading(filePath);
   try {
     const lines: string[] = [];
     let buffer = '';
