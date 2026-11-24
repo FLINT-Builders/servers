@@ -118,10 +118,13 @@ pip install mcp-server-git
 After installation, you can run it as a script using:
 
 ```
-python -m mcp_server_git
+python -m mcp_server_git --repository path/to/git/repo
 ```
 
 ## Configuration
+
+The `--repository` (`-r`) option is required. It names the Git repository that the tools may access.
+Tool calls for paths outside it are rejected, and when the option is omitted every tool call is rejected.
 
 ### Usage with Claude Desktop
 
@@ -143,13 +146,13 @@ Add this to your `claude_desktop_config.json`:
 <details>
 <summary>Using docker</summary>
 
-* Note: replace '/Users/username' with a path that you want to be accessible by this tool
+* Note: replace '/Users/username/path/to/git/repo' with the repository that you want to be accessible by this tool
 
 ```json
 "mcpServers": {
   "git": {
     "command": "docker",
-    "args": ["run", "--rm", "-i", "--mount", "type=bind,src=/Users/username,dst=/Users/username", "mcp/git"]
+    "args": ["run", "--rm", "-i", "--mount", "type=bind,src=/Users/username/path/to/git/repo,dst=/Users/username/path/to/git/repo", "mcp/git", "--repository", "/Users/username/path/to/git/repo"]
   }
 }
 ```
@@ -172,9 +175,9 @@ Add this to your `claude_desktop_config.json`:
 
 For quick installation, use one of the one-click install buttons below...
 
-[![Install with UV in VS Code](https://img.shields.io/badge/VS_Code-UV-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-git%22%5D%7D) [![Install with UV in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-UV-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-git%22%5D%7D&quality=insiders)
+[![Install with UV in VS Code](https://img.shields.io/badge/VS_Code-UV-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-git%22%2C%22--repository%22%2C%22%24%7BworkspaceFolder%7D%22%5D%7D) [![Install with UV in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-UV-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22mcp-server-git%22%2C%22--repository%22%2C%22%24%7BworkspaceFolder%7D%22%5D%7D&quality=insiders)
 
-[![Install with Docker in VS Code](https://img.shields.io/badge/VS_Code-Docker-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22--rm%22%2C%22-i%22%2C%22--mount%22%2C%22type%3Dbind%2Csrc%3D%24%7BworkspaceFolder%7D%2Cdst%3D%2Fworkspace%22%2C%22mcp%2Fgit%22%5D%7D) [![Install with Docker in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Docker-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22--rm%22%2C%22-i%22%2C%22--mount%22%2C%22type%3Dbind%2Csrc%3D%24%7BworkspaceFolder%7D%2Cdst%3D%2Fworkspace%22%2C%22mcp%2Fgit%22%5D%7D&quality=insiders)
+[![Install with Docker in VS Code](https://img.shields.io/badge/VS_Code-Docker-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22--rm%22%2C%22-i%22%2C%22--mount%22%2C%22type%3Dbind%2Csrc%3D%24%7BworkspaceFolder%7D%2Cdst%3D%2Fworkspace%22%2C%22mcp%2Fgit%22%2C%22--repository%22%2C%22%2Fworkspace%22%5D%7D) [![Install with Docker in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Docker-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=git&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22--rm%22%2C%22-i%22%2C%22--mount%22%2C%22type%3Dbind%2Csrc%3D%24%7BworkspaceFolder%7D%2Cdst%3D%2Fworkspace%22%2C%22mcp%2Fgit%22%2C%22--repository%22%2C%22%2Fworkspace%22%5D%7D&quality=insiders)
 
 For manual installation, you can configure the MCP server using one of these methods:
 
@@ -191,7 +194,7 @@ Alternatively, you can add the configuration to a file called `.vscode/mcp.json`
   "servers": {
     "git": {
       "command": "uvx",
-      "args": ["mcp-server-git"]
+      "args": ["mcp-server-git", "--repository", "${workspaceFolder}"]
     }
   }
 }
@@ -210,7 +213,8 @@ For Docker installation:
           "--rm",
           "-i",
           "--mount", "type=bind,src=${workspaceFolder},dst=/workspace",
-          "mcp/git"
+          "mcp/git",
+          "--repository", "/workspace"
         ]
       }
     }
@@ -230,7 +234,7 @@ Add to your Zed settings.json:
   "mcp-server-git": {
     "command": {
       "path": "uvx",
-      "args": ["mcp-server-git"]
+      "args": ["mcp-server-git", "--repository", "path/to/git/repo"]
     }
   }
 ],
@@ -245,7 +249,7 @@ Add to your Zed settings.json:
   "mcp-server-git": {
     "command": {
       "path": "python",
-      "args": ["-m", "mcp_server_git"]
+      "args": ["-m", "mcp_server_git", "--repository", "path/to/git/repo"]
     }
   }
 },
@@ -275,14 +279,14 @@ Add to your Zed settings.json:
 You can use the MCP inspector to debug the server. For uvx installations:
 
 ```
-npx @modelcontextprotocol/inspector uvx mcp-server-git
+npx @modelcontextprotocol/inspector uvx mcp-server-git --repository path/to/git/repo
 ```
 
 Or if you've installed the package in a specific directory or are developing on it:
 
 ```
 cd path/to/servers/src/git
-npx @modelcontextprotocol/inspector uv run mcp-server-git
+npx @modelcontextprotocol/inspector uv run mcp-server-git --repository path/to/git/repo
 ```
 
 Running `tail -n 20 -f ~/Library/Logs/Claude/mcp*.log` will show the logs from the server and may
@@ -310,7 +314,8 @@ If you are doing local development, there are two ways to test your changes:
         "--mount", "type=bind,src=/Users/username/Desktop,dst=/projects/Desktop",
         "--mount", "type=bind,src=/path/to/other/allowed/dir,dst=/projects/other/allowed/dir,ro",
         "--mount", "type=bind,src=/path/to/file.txt,dst=/projects/path/to/file.txt",
-        "mcp/git"
+        "mcp/git",
+        "--repository", "/projects/Desktop/path/to/git/repo"
       ]
     }
   }
@@ -327,7 +332,9 @@ If you are doing local development, there are two ways to test your changes:
       "--directory",
       "/<path to mcp-servers>/mcp-servers/src/git",
       "run",
-      "mcp-server-git"
+      "mcp-server-git",
+      "--repository",
+      "path/to/git/repo"
     ]
     }
   }
