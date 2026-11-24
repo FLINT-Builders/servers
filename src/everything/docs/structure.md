@@ -58,6 +58,7 @@ src/everything
      │   ├── trigger-sampling-request-async.ts
      │   └── trigger-url-elicitation.ts
      └── transports
+         ├── http-security.ts
          ├── sse.ts
          ├── stdio.ts
          └── streamableHttp.ts
@@ -188,6 +189,8 @@ src/everything
 
 ### `transports/`
 
+- `http-security.ts`
+  - Shared by the HTTP transports: binds to `127.0.0.1` unless `MCP_HOST` is set, validates the `Host` header (extendable via `MCP_ALLOWED_HOSTS`), rejects non-loopback `Origin`s (extendable via `MCP_ALLOWED_ORIGINS`), and restricts CORS to allowed origins.
 - `stdio.ts`
   - Starts a `StdioServerTransport`, created the server via `createServer()`, and connects it.
   - Handles `SIGINT` to close cleanly and calls `cleanup()` to remove any live intervals.

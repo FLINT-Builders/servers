@@ -135,6 +135,20 @@ npx @modelcontextprotocol/server-everything sse
 npx @modelcontextprotocol/server-everything streamableHttp
 ```
 
+## HTTP transport security
+
+The SSE and streamable HTTP servers have no authentication, so by default they:
+
+- Listen on `127.0.0.1` only (port `3001`, or `PORT`).
+- Reject requests whose `Host` header is not `localhost`, `127.0.0.1` or `[::1]` (DNS rebinding protection).
+- Reject browser requests whose `Origin` is not a loopback origin such as the MCP Inspector at `http://localhost:6274`, and only send CORS headers to allowed origins.
+
+These environment variables relax the defaults:
+
+- `MCP_HOST`: address to listen on, e.g. `0.0.0.0`. Anyone who can reach that address can call every tool, including `get-env`, so only use it on a trusted network.
+- `MCP_ALLOWED_HOSTS`: comma-separated extra hostnames accepted in the `Host` header (the `MCP_HOST` address is accepted automatically unless it is a wildcard).
+- `MCP_ALLOWED_ORIGINS`: comma-separated extra browser origins, e.g. `https://inspector.example.com`.
+
 ## License
 
 This MCP server is licensed under the MIT License. This means you are free to use, modify, and distribute the software, subject to the terms and conditions of the MIT License. For more details, please see the LICENSE file in the project repository.

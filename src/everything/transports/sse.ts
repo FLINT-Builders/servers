@@ -1,20 +1,17 @@
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import { createServer } from "../server/index.js";
-import cors from "cors";
+import { applyHttpSecurity, HTTP_HOST, HTTP_PORT } from "./http-security.js";
 
 console.error("Starting SSE server...");
 
-// Express app with permissive CORS for testing with Inspector direct connect mode
+// Express app restricted to local hosts and origins (e.g. Inspector direct connect mode)
 const app = express();
-app.use(
-  cors({
-    origin: "*", // use "*" with caution in production
-    methods: "GET,POST",
-    preflightContinue: false,
-    optionsSuccessStatus: 204,
-  })
-);
+applyHttpSecurity(app, {
+  methods: "GET,POST",
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+});
 
 // Map sessionId to transport for each client
 const transports: Map<string, SSEServerTransport> = new Map<
@@ -71,7 +68,7 @@ app.post("/message", async (req, res) => {
 });
 
 // Start the express server
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.error(`Server is running on port ${PORT}`);
+const PORT = HTTP_PORT;
+app.listen(Number(PORT), HTTP_HOST, () => {
+  console.error(`Server is running on ${HTTP_HOST} port ${PORT}`);
 });
