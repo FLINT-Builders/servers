@@ -67,11 +67,11 @@ Python-based servers in this repository can be used directly with [`uvx`](https:
 For example, this will start the [Git](src/git) server:
 ```sh
 # With uvx
-uvx mcp-server-git
+uvx mcp-server-git --repository path/to/git/repo
 
 # With pip
 pip install mcp-server-git
-python -m mcp_server_git
+python -m mcp_server_git --repository path/to/git/repo
 ```
 
 Follow [these](https://docs.astral.sh/uv/getting-started/installation/) instructions to install `uv` / `uvx` and [these](https://pip.pypa.io/en/stable/installation/) to install `pip`.
