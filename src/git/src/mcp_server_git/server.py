@@ -126,7 +126,10 @@ def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_L
     return repo.git.diff(f"--unified={context_lines}", target)
 
 def git_commit(repo: git.Repo, message: str) -> str:
-    commit = repo.index.commit(message)
+    # GitPython runs hooks itself from the git directory it resolved, which can
+    # be a tracked directory that only mimics one (e.g. a subdirectory whose
+    # `commondir` points at the real `.git`), so its hooks are attacker content.
+    commit = repo.index.commit(message, skip_hooks=True)
     return f"Changes committed successfully with hash {commit.hexsha}"
 
 def git_add(repo: git.Repo, files: list[str]) -> str:
