@@ -1,6 +1,8 @@
+import functools
 import logging
+import tempfile
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Concatenate, Optional, ParamSpec, Sequence, TypeVar
 from mcp.server import Server
 from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
@@ -108,15 +110,44 @@ class GitTools(str, Enum):
 
     BRANCH = "git_branch"
 
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def without_repository_hooks(
+    func: Callable[Concatenate[git.Repo, P], R],
+) -> Callable[Concatenate[git.Repo, P], R]:
+    """Run every git command issued through ``repo.git`` with repository hooks disabled.
+
+    A ``core.hooksPath`` may point into the working tree, where any branch can
+    replace the scripts. A command-line ``-c`` overrides every config file, so
+    an empty hooks directory leaves git nothing to run.
+    """
+    @functools.wraps(func)
+    def wrapper(repo: git.Repo, *args: P.args, **kwargs: P.kwargs) -> R:
+        previous = list(repo.git._persistent_git_options)
+        with tempfile.TemporaryDirectory(prefix="mcp-git-no-hooks-") as empty_hooks_dir:
+            repo.git._persistent_git_options = [
+                *previous, "-c", f"core.hooksPath={empty_hooks_dir}",
+            ]
+            try:
+                return func(repo, *args, **kwargs)
+            finally:
+                repo.git._persistent_git_options = previous
+    return wrapper
+
+@without_repository_hooks
 def git_status(repo: git.Repo) -> str:
     return repo.git.status()
 
+@without_repository_hooks
 def git_diff_unstaged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
     return repo.git.diff(f"--unified={context_lines}")
 
+@without_repository_hooks
 def git_diff_staged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
     return repo.git.diff(f"--unified={context_lines}", "--cached")
 
+@without_repository_hooks
 def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
     # Defense in depth: reject targets starting with '-' to prevent flag injection,
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
@@ -125,10 +156,12 @@ def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_L
     repo.rev_parse(target)  # Validates target is a real git ref, throws BadName if not
     return repo.git.diff(f"--unified={context_lines}", target)
 
+@without_repository_hooks
 def git_commit(repo: git.Repo, message: str) -> str:
-    commit = repo.index.commit(message)
+    commit = repo.index.commit(message, skip_hooks=True)
     return f"Changes committed successfully with hash {commit.hexsha}"
 
+@without_repository_hooks
 def git_add(repo: git.Repo, files: list[str]) -> str:
     if files == ["."]:
         repo.git.add(".")
@@ -152,10 +185,12 @@ def git_add(repo: git.Repo, files: list[str]) -> str:
         repo.git.add("--", *files)
     return "Files staged successfully"
 
+@without_repository_hooks
 def git_reset(repo: git.Repo) -> str:
     repo.index.reset()
     return "All staged changes reset"
 
+@without_repository_hooks
 def git_log(repo: git.Repo, max_count: int = 10, start_timestamp: Optional[str] = None, end_timestamp: Optional[str] = None) -> list[str]:
     # Defense in depth: reject timestamps starting with '-' to prevent flag injection
     if start_timestamp and start_timestamp.startswith("-"):
@@ -180,6 +215,7 @@ def git_log(repo: git.Repo, max_count: int = 10, start_timestamp: Optional[str] 
         )
     return log
 
+@without_repository_hooks
 def git_create_branch(repo: git.Repo, branch_name: str, base_branch: str | None = None) -> str:
     # Defense in depth: reject names starting with '-' to prevent flag injection
     if branch_name.startswith("-"):
@@ -194,6 +230,7 @@ def git_create_branch(repo: git.Repo, branch_name: str, base_branch: str | None 
     repo.create_head(branch_name, base)
     return f"Created branch '{branch_name}' from '{base.name}'"
 
+@without_repository_hooks
 def git_checkout(repo: git.Repo, branch_name: str) -> str:
     # Defense in depth: reject branch names starting with '-' to prevent flag injection,
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
@@ -205,6 +242,7 @@ def git_checkout(repo: git.Repo, branch_name: str) -> str:
 
 
 
+@without_repository_hooks
 def git_show(repo: git.Repo, revision: str) -> str:
     # Defense in depth: reject revisions starting with '-' to prevent flag injection,
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
@@ -253,6 +291,7 @@ def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None
         )
 
 
+@without_repository_hooks
 def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, not_contains: str | None = None) -> str:
     # Defense in depth: reject values starting with '-' to prevent flag injection
     if contains and contains.startswith("-"):
