@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from mcp.server import Server
@@ -232,10 +233,15 @@ def git_show(repo: git.Repo, revision: str) -> str:
             output.append(d.diff)
     return "".join(output)
 
-def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None:
-    """Validate that repo_path is within the allowed repository path."""
+def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> Path:
+    """Validate that repo_path is within the allowed repository path.
+
+    Returns the path that was authorized. When an allowlist is configured this
+    is the resolved path, and callers must use it instead of repo_path: looking
+    repo_path up again would follow its symlinks a second time, after the check.
+    """
     if allowed_repository is None:
-        return  # No restriction configured
+        return repo_path  # No restriction configured
 
     # Resolve both paths to handle symlinks and relative paths
     try:
@@ -251,6 +257,35 @@ def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None
         raise ValueError(
             f"Repository path '{repo_path}' is outside the allowed repository '{allowed_repository}'"
         )
+    return resolved_repo
+
+
+def open_repo(repo_path: Path, allowed_repository: Path | None) -> git.Repo:
+    """Open the repository at repo_path, confined to allowed_repository if set."""
+    authorized_path = validate_repo_path(repo_path, allowed_repository)
+    if allowed_repository is None:
+        return git.Repo(authorized_path)
+
+    try:
+        authorized = os.stat(authorized_path)
+    except OSError:
+        raise ValueError(f"Invalid path: {repo_path}")
+
+    repo = git.Repo(authorized_path)
+
+    try:
+        opened = os.stat(authorized_path)
+    except OSError:
+        raise ValueError(f"Repository path '{repo_path}' changed while it was being opened")
+    if not os.path.samestat(authorized, opened):
+        raise ValueError(f"Repository path '{repo_path}' changed while it was being opened")
+
+    # The git directory may live elsewhere (a .git file, a linked worktree or
+    # core.worktree), so every location git will touch must be confined too.
+    for location in (repo.git_dir, repo.common_dir, repo.working_tree_dir):
+        if location is not None:
+            validate_repo_path(Path(location), allowed_repository)
+    return repo
 
 
 def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, not_contains: str | None = None) -> str:
@@ -471,11 +506,8 @@ async def serve(repository: Path | None) -> None:
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         repo_path = Path(arguments["repo_path"])
 
-        # Validate repo_path is within allowed repository
-        validate_repo_path(repo_path, repository)
-
-        # For all commands, we need an existing repo
-        repo = git.Repo(repo_path)
+        # For all commands, we need an existing repo within the allowed repository
+        repo = open_repo(repo_path, repository)
 
         match name:
             case GitTools.STATUS:
