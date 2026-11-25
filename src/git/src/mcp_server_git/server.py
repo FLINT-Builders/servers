@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from mcp.server import Server
@@ -232,25 +233,64 @@ def git_show(repo: git.Repo, revision: str) -> str:
             output.append(d.diff)
     return "".join(output)
 
-def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None:
-    """Validate that repo_path is within the allowed repository path."""
-    if allowed_repository is None:
-        return  # No restriction configured
+def canonicalize_repo_path(repo_path: str | os.PathLike[str]) -> Path:
+    """Return the absolute, symlink-free path that will be opened for repo_path.
 
-    # Resolve both paths to handle symlinks and relative paths
+    '~' is expanded here because GitPython always expands it. '$VAR' references
+    are deliberately left literal, and repositories must be opened with
+    expand_vars=False so GitPython does not expand them either.
+    """
     try:
-        resolved_repo = repo_path.resolve()
-        resolved_allowed = allowed_repository.resolve()
+        return Path(os.path.expanduser(os.fspath(repo_path))).resolve()
     except (OSError, RuntimeError):
         raise ValueError(f"Invalid path: {repo_path}")
 
-    # Check if repo_path is the same as or a subdirectory of allowed_repository
+
+def _ensure_within(path: Path, resolved_allowed: Path, repo_path: object, allowed_repository: Path) -> None:
     try:
-        resolved_repo.relative_to(resolved_allowed)
+        path.relative_to(resolved_allowed)
     except ValueError:
         raise ValueError(
             f"Repository path '{repo_path}' is outside the allowed repository '{allowed_repository}'"
         )
+
+
+def validate_repo_path(repo_path: str | os.PathLike[str], allowed_repository: Path | None) -> Path:
+    """Validate that repo_path is within the allowed repository path.
+
+    Returns the canonical path that was checked; that path, not the original
+    argument, is the one that may be opened.
+    """
+    resolved_repo = canonicalize_repo_path(repo_path)
+    if allowed_repository is None:
+        return resolved_repo  # No restriction configured
+
+    resolved_allowed = canonicalize_repo_path(allowed_repository)
+    _ensure_within(resolved_repo, resolved_allowed, repo_path, allowed_repository)
+    return resolved_repo
+
+
+def open_repo(repo_path: str | os.PathLike[str], allowed_repository: Path | None) -> git.Repo:
+    """Open the repository at repo_path, confined to allowed_repository."""
+    resolved_repo = validate_repo_path(repo_path, allowed_repository)
+    repo = git.Repo(resolved_repo, expand_vars=False)
+    if allowed_repository is None:
+        return repo
+
+    # The working tree git will operate on can differ from the opened path
+    # (e.g. core.worktree or GIT_WORK_TREE), so confine the opened repository too.
+    opened = repo.working_tree_dir if repo.working_tree_dir is not None else repo.git_dir
+    try:
+        _ensure_within(
+            canonicalize_repo_path(opened),
+            canonicalize_repo_path(allowed_repository),
+            repo_path,
+            allowed_repository,
+        )
+    except ValueError:
+        repo.close()
+        raise
+    return repo
 
 
 def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, not_contains: str | None = None) -> str:
@@ -293,7 +333,7 @@ async def serve(repository: Path | None) -> None:
 
     if repository is not None:
         try:
-            git.Repo(repository)
+            git.Repo(canonicalize_repo_path(repository), expand_vars=False)
             logger.info(f"Using repository at {repository}")
         except git.InvalidGitRepositoryError:
             logger.error(f"{repository} is not a valid Git repository")
@@ -454,7 +494,7 @@ async def serve(repository: Path | None) -> None:
             for root in roots_result.roots:
                 path = root.uri.path
                 try:
-                    git.Repo(path)
+                    git.Repo(path, expand_vars=False)
                     repo_paths.append(str(path))
                 except git.InvalidGitRepositoryError:
                     pass
@@ -469,13 +509,8 @@ async def serve(repository: Path | None) -> None:
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        repo_path = Path(arguments["repo_path"])
-
-        # Validate repo_path is within allowed repository
-        validate_repo_path(repo_path, repository)
-
-        # For all commands, we need an existing repo
-        repo = git.Repo(repo_path)
+        # For all commands, we need an existing repo within the allowed repository
+        repo = open_repo(arguments["repo_path"], repository)
 
         match name:
             case GitTools.STATUS:
