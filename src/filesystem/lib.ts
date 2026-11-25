@@ -198,8 +198,49 @@ export async function getFileStats(filePath: string): Promise<FileInfo> {
   };
 }
 
+// Upper bound on the bytes any single tool call may read from one file. Reads
+// stop as soon as this is exceeded, so an oversized file (or a fifo/device
+// whose stat size is 0) can never be buffered in full.
+export const MAX_FILE_READ_BYTES = 1024 * 1024;
+export const MAX_MULTIPLE_READ_PATHS = 10;
+const READ_CHUNK_BYTES = 64 * 1024;
+
+function fileTooLargeError(filePath: string, maxBytes: number): Error {
+  return new Error(`File exceeds the maximum read size of ${maxBytes} bytes: ${filePath}`);
+}
+
+// Opens the file once and reads through that handle, so the size check and the
+// read apply to the same object. stat.size is only used to refuse early; the
+// byte count is enforced on the data actually read.
+export async function readFileBytes(filePath: string, maxBytes: number = MAX_FILE_READ_BYTES): Promise<Buffer> {
+  const fileHandle = await fs.open(filePath, 'r');
+  try {
+    const stats = await fileHandle.stat();
+    if (stats.size > maxBytes) {
+      throw fileTooLargeError(filePath, maxBytes);
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    while (true) {
+      const chunk = Buffer.alloc(Math.min(READ_CHUNK_BYTES, maxBytes + 1 - totalBytes));
+      const { bytesRead } = await fileHandle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      totalBytes += bytesRead;
+      if (totalBytes > maxBytes) {
+        throw fileTooLargeError(filePath, maxBytes);
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, totalBytes);
+  } finally {
+    await fileHandle.close();
+  }
+}
+
 export async function readFileContent(filePath: string, encoding: string = 'utf-8'): Promise<string> {
-  return await fs.readFile(filePath, encoding as BufferEncoding);
+  const content = await readFileBytes(filePath);
+  return content.toString(encoding as BufferEncoding);
 }
 
 export async function writeFileContent(filePath: string, content: string): Promise<void> {
@@ -268,7 +309,7 @@ export async function applyFileEdits(
   dryRun: boolean = false
 ): Promise<string> {
   // Read file content and normalize line endings
-  const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
+  const content = normalizeLineEndings(await readFileContent(filePath));
 
   // Apply edits sequentially
   let modifiedContent = content;
@@ -375,14 +416,19 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
     let position = fileSize;
     const chunk = Buffer.alloc(CHUNK_SIZE);
     let newlinesFound = 0;
+    let totalBytesRead = 0;
     
     // Read chunks from the end of the file until we have enough lines
     while (position > 0 && newlinesFound < numLines) {
-      const size = Math.min(CHUNK_SIZE, position);
+      if (totalBytesRead >= MAX_FILE_READ_BYTES) {
+        throw fileTooLargeError(filePath, MAX_FILE_READ_BYTES);
+      }
+      const size = Math.min(CHUNK_SIZE, position, MAX_FILE_READ_BYTES - totalBytesRead);
       position -= size;
       
       const { bytesRead } = await fileHandle.read(chunk, 0, size, position);
       if (!bytesRead) break;
+      totalBytesRead += bytesRead;
 
       const readData = Buffer.from(chunk.subarray(0, bytesRead));
       chunks.unshift(readData);
@@ -410,9 +456,13 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
     
     // Read chunks and count lines until we have enough or reach EOF
     while (lines.length < numLines) {
-      const result = await fileHandle.read(chunk, 0, chunk.length, bytesRead);
+      const length = Math.min(chunk.length, MAX_FILE_READ_BYTES + 1 - bytesRead);
+      const result = await fileHandle.read(chunk, 0, length, bytesRead);
       if (result.bytesRead === 0) break; // End of file
       bytesRead += result.bytesRead;
+      if (bytesRead > MAX_FILE_READ_BYTES) {
+        throw fileTooLargeError(filePath, MAX_FILE_READ_BYTES);
+      }
       buffer += decoder.write(chunk.subarray(0, result.bytesRead));
       
       const newLineIndex = buffer.lastIndexOf('\n');

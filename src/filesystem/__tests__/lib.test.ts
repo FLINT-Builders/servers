@@ -28,20 +28,28 @@ vi.mock('fs/promises');
 const mockFs = fs as any;
 
 function createMockFileHandle(content: Buffer) {
+  let currentPosition = 0;
   return {
     read: vi.fn(
-      async (buffer: Buffer, offset: number, length: number, position: number) => {
+      async (buffer: Buffer, offset: number, length: number, position: number | null) => {
+        const start = position ?? currentPosition;
         const bytesRead = content.copy(
           buffer,
           offset,
-          position,
-          Math.min(position + length, content.length),
+          start,
+          Math.min(start + length, content.length),
         );
+        if (position === null) currentPosition += bytesRead;
         return { bytesRead, buffer };
       },
     ),
+    stat: vi.fn().mockResolvedValue({ size: content.length }),
     close: vi.fn().mockResolvedValue(undefined),
   };
+}
+
+function mockFileContent(content: string) {
+  mockFs.open.mockImplementation(async () => createMockFileHandle(Buffer.from(content)));
 }
 
 describe('Lib Functions', () => {
@@ -324,21 +332,21 @@ describe('Lib Functions', () => {
 
     describe('readFileContent', () => {
       it('reads file with default encoding', async () => {
-        mockFs.readFile.mockResolvedValueOnce('file content');
+        mockFileContent('file content');
         
         const result = await readFileContent('/test/file.txt');
         
         expect(result).toBe('file content');
-        expect(mockFs.readFile).toHaveBeenCalledWith('/test/file.txt', 'utf-8');
+        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
       });
 
       it('reads file with custom encoding', async () => {
-        mockFs.readFile.mockResolvedValueOnce('file content');
+        mockFileContent('file content');
         
         const result = await readFileContent('/test/file.txt', 'ascii');
         
         expect(result).toBe('file content');
-        expect(mockFs.readFile).toHaveBeenCalledWith('/test/file.txt', 'ascii');
+        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
       });
     });
 
@@ -506,7 +514,7 @@ describe('Lib Functions', () => {
   describe('File Editing Functions', () => {
     describe('applyFileEdits', () => {
       beforeEach(() => {
-        mockFs.readFile.mockResolvedValue('line1\nline2\nline3\n');
+        mockFileContent('line1\nline2\nline3\n');
         mockFs.writeFile.mockResolvedValue(undefined);
         mockFs.stat.mockResolvedValue({ mode: 0o100644 });
         mockFs.chmod.mockResolvedValue(undefined);
@@ -583,7 +591,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles whitespace-flexible matching', async () => {
-        mockFs.readFile.mockResolvedValue('  line1\n    line2\n  line3\n');
+        mockFileContent('  line1\n    line2\n  line3\n');
         
         const edits = [
           { oldText: 'line2', newText: 'modified line2' }
@@ -638,7 +646,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles complex multi-line edits with indentation', async () => {
-        mockFs.readFile.mockResolvedValue('function test() {\n  console.log("hello");\n  return true;\n}');
+        mockFileContent('function test() {\n  console.log("hello");\n  return true;\n}');
         
         const edits = [
           { 
@@ -663,7 +671,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles edits with different indentation patterns', async () => {
-        mockFs.readFile.mockResolvedValue('    if (condition) {\n        doSomething();\n    }');
+        mockFileContent('    if (condition) {\n        doSomething();\n    }');
         
         const edits = [
           { 
@@ -688,7 +696,7 @@ describe('Lib Functions', () => {
       });
 
       it('handles CRLF line endings in file content', async () => {
-        mockFs.readFile.mockResolvedValue('line1\r\nline2\r\nline3\r\n');
+        mockFileContent('line1\r\nline2\r\nline3\r\n');
         
         const edits = [
           { oldText: 'line2', newText: 'modified line2' }
