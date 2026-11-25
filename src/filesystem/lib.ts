@@ -439,6 +439,42 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
   }
 }
 
+// Limits for recursive walks (directory_tree, search_files). The requested
+// path is depth 0 and does not count as an entry.
+export const MAX_WALK_ENTRIES = 5000;
+export const MAX_WALK_DEPTH = 20;
+// Skipped wherever they appear below the requested path; request one of them
+// directly to walk it.
+export const SKIPPED_WALK_DIRECTORIES: ReadonlySet<string> = new Set(['node_modules', '.git', 'dist']);
+
+export class WalkLimitError extends Error {}
+
+export interface WalkLimiter {
+  countEntries(count: number): void;
+  enterDirectory(depth: number): void;
+}
+
+export function createWalkLimiter(toolName: string): WalkLimiter {
+  let visited = 0;
+  return {
+    countEntries(count: number): void {
+      visited += count;
+      if (visited > MAX_WALK_ENTRIES) {
+        throw new WalkLimitError(`${toolName} exceeds maximum of ${MAX_WALK_ENTRIES} entries`);
+      }
+    },
+    enterDirectory(depth: number): void {
+      if (depth > MAX_WALK_DEPTH) {
+        throw new WalkLimitError(`${toolName} exceeds maximum depth of ${MAX_WALK_DEPTH}`);
+      }
+    },
+  };
+}
+
+export function isSkippedWalkDirectory(entry: { name: string; isDirectory(): boolean }): boolean {
+  return entry.isDirectory() && SKIPPED_WALK_DIRECTORIES.has(entry.name);
+}
+
 export async function searchFilesWithValidation(
   rootPath: string,
   pattern: string,
@@ -447,11 +483,16 @@ export async function searchFilesWithValidation(
 ): Promise<string[]> {
   const { excludePatterns = [] } = options;
   const results: string[] = [];
+  const limiter = createWalkLimiter('search_files');
 
-  async function search(currentPath: string) {
+  async function search(currentPath: string, depth: number) {
+    limiter.enterDirectory(depth);
     const entries = await fs.readdir(currentPath, { withFileTypes: true });
+    limiter.countEntries(entries.length);
 
     for (const entry of entries) {
+      if (isSkippedWalkDirectory(entry)) continue;
+
       const fullPath = path.join(currentPath, entry.name);
 
       try {
@@ -470,14 +511,15 @@ export async function searchFilesWithValidation(
         }
 
         if (entry.isDirectory()) {
-          await search(fullPath);
+          await search(fullPath, depth + 1);
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof WalkLimitError) throw error;
         continue;
       }
     }
   }
 
-  await search(rootPath);
+  await search(rootPath, 0);
   return results;
 }

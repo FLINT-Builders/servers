@@ -23,6 +23,10 @@ import {
   writeFileContent,
   moveFile,
   searchFilesWithValidation,
+  createWalkLimiter,
+  isSkippedWalkDirectory,
+  MAX_WALK_ENTRIES,
+  MAX_WALK_DEPTH,
   applyFileEdits,
   tailFile,
   headFile,
@@ -551,7 +555,10 @@ server.registerTool(
       "Get a recursive tree view of files and directories as a JSON structure. " +
       "Each entry includes 'name', 'type' (file/directory), and 'children' for directories. " +
       "Files have no children array, while directories always have a children array (which may be empty). " +
-      "The output is formatted with 2-space indentation for readability. Only works within allowed directories.",
+      "The output is formatted with 2-space indentation for readability. " +
+      `Fails if the tree has more than ${MAX_WALK_ENTRIES} entries or is nested more than ${MAX_WALK_DEPTH} directories deep. ` +
+      "Directories named node_modules, .git, or dist below the requested path are skipped; pass one of them as the path to list it. " +
+      "Only works within allowed directories.",
     inputSchema: {
       path: z.string(),
       excludePatterns: z.array(z.string()).optional().default([])
@@ -567,12 +574,19 @@ server.registerTool(
     }
     const rootPath = args.path;
 
-    async function buildTree(currentPath: string, excludePatterns: string[] = []): Promise<TreeEntry[]> {
+    const limiter = createWalkLimiter('directory_tree');
+
+    async function buildTree(currentPath: string, depth: number, excludePatterns: string[] = []): Promise<TreeEntry[]> {
+      limiter.enterDirectory(depth);
       const validPath = await validatePath(currentPath);
       const entries = await fs.readdir(validPath, { withFileTypes: true });
+      limiter.countEntries(entries.length);
       const result: TreeEntry[] = [];
 
       for (const entry of entries) {
+        if (isSkippedWalkDirectory(entry))
+          continue;
+
         const relativePath = path.relative(rootPath, path.join(currentPath, entry.name));
         const shouldExclude = excludePatterns.some(pattern => {
           if (pattern.includes('*')) {
@@ -594,7 +608,7 @@ server.registerTool(
 
         if (entry.isDirectory()) {
           const subPath = path.join(currentPath, entry.name);
-          entryData.children = await buildTree(subPath, excludePatterns);
+          entryData.children = await buildTree(subPath, depth + 1, excludePatterns);
         }
 
         result.push(entryData);
@@ -603,7 +617,7 @@ server.registerTool(
       return result;
     }
 
-    const treeData = await buildTree(rootPath, args.excludePatterns);
+    const treeData = await buildTree(rootPath, 0, args.excludePatterns);
     const text = JSON.stringify(treeData, null, 2);
     const contentBlock = { type: "text" as const, text };
     return {
@@ -651,6 +665,8 @@ server.registerTool(
       "The patterns should be glob-style patterns that match paths relative to the working directory. " +
       "Use pattern like '*.ext' to match files in current directory, and '**/*.ext' to match files in all subdirectories. " +
       "Returns full paths to all matching items. Great for finding files when you don't know their exact location. " +
+      `Fails if the search visits more than ${MAX_WALK_ENTRIES} entries or descends more than ${MAX_WALK_DEPTH} directories deep. ` +
+      "Directories named node_modules, .git, or dist below the requested path are skipped; pass one of them as the path to search it. " +
       "Only searches within allowed directories.",
     inputSchema: {
       path: z.string(),
