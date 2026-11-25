@@ -76,6 +76,8 @@ The server's directory access control follows this flow:
     - `tail` (number, optional): Last N lines
   - Always treats the file as UTF-8 text regardless of extension
   - Cannot specify both `head` and `tail` simultaneously
+  - Fails if more than 1 MiB would have to be read: the whole file, or with `head`/`tail`
+    the bytes needed to reach the requested lines
 
 - **read_media_file**
   - Read a file and return it as a base64-encoded content block with its MIME type
@@ -84,11 +86,13 @@ The server's directory access control follows this flow:
   - Streams the file and returns base64 data with the corresponding MIME type. Image and
     audio files are returned as `image`/`audio` content; any other file type is returned as
     an embedded `resource` (a valid MCP content block for arbitrary binary data)
+  - Fails if the file exceeds 1 MiB
 
 - **read_multiple_files**
   - Read multiple files simultaneously
-  - Input: `paths` (string[])
+  - Input: `paths` (string[], at most 10)
   - Failed reads won't stop the entire operation
+  - Each file is subject to the same 1 MiB limit as `read_text_file`
 
 - **write_file**
   - Create new file or overwrite existing (exercise caution with this)

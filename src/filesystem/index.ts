@@ -7,7 +7,6 @@ import {
   type Root,
 } from "@modelcontextprotocol/sdk/types.js";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
 import path from "path";
 import { pathToFileURL } from "url";
 import { z } from "zod";
@@ -19,6 +18,7 @@ import {
   formatSize,
   validatePath,
   getFileStats,
+  readFileBytes,
   readFileContent,
   writeFileContent,
   moveFile,
@@ -27,6 +27,7 @@ import {
   tailFile,
   headFile,
   setAllowedDirectories,
+  MAX_MULTIPLE_READ_PATHS,
 } from './lib.js';
 
 // Command line argument parsing
@@ -108,6 +109,7 @@ const ReadMultipleFilesArgsSchema = z.object({
   paths: z
     .array(z.string())
     .min(1, "At least one file path must be provided")
+    .max(MAX_MULTIPLE_READ_PATHS, `Too many paths: at most ${MAX_MULTIPLE_READ_PATHS} files can be read at once`)
     .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories."),
 });
 
@@ -168,24 +170,6 @@ const server = new McpServer(
   }
 );
 
-// Reads a file as a stream of buffers, concatenates them, and then encodes
-// the result to a Base64 string. This is a memory-efficient way to handle
-// binary data from a stream before the final encoding.
-async function readFileAsBase64Stream(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath);
-    const chunks: Buffer[] = [];
-    stream.on('data', (chunk) => {
-      chunks.push(chunk as Buffer);
-    });
-    stream.on('end', () => {
-      const finalBuffer = Buffer.concat(chunks);
-      resolve(finalBuffer.toString('base64'));
-    });
-    stream.on('error', (err) => reject(err));
-  });
-}
-
 // Tool registrations
 
 // read_file (deprecated) and read_text_file
@@ -234,7 +218,8 @@ server.registerTool(
       "the contents of a single file. Use the 'head' parameter to read only " +
       "the first N lines of a file, or the 'tail' parameter to read only " +
       "the last N lines of a file. Operates on the file as text regardless of extension. " +
-      "Only works within allowed directories.",
+      "Reads are limited to 1 MiB; 'head' and 'tail' work on larger files as long as " +
+      "the requested lines fit within that limit. Only works within allowed directories.",
     inputSchema: {
       path: z.string(),
       tail: z.number().optional().describe("If provided, returns only the last N lines of the file"),
@@ -253,7 +238,8 @@ server.registerTool(
     description:
       "Read a file and return it as a base64-encoded content block with its MIME type. " +
       "Image and audio files are returned as image/audio content; any other file type is " +
-      "returned as an embedded resource. Only works within allowed directories.",
+      "returned as an embedded resource. Files larger than 1 MiB are rejected. " +
+      "Only works within allowed directories.",
     inputSchema: {
       path: z.string()
     },
@@ -294,7 +280,7 @@ server.registerTool(
       ".flac": "audio/flac",
     };
     const mimeType = mimeTypes[extension] || "application/octet-stream";
-    const data = await readFileAsBase64Stream(validPath);
+    const data = (await readFileBytes(validPath)).toString("base64");
 
     // Map the MIME type to a valid MCP content block. The spec only allows
     // text, image, audio, resource_link, and resource — so non-image/audio
@@ -325,10 +311,12 @@ server.registerTool(
       "efficient than reading files one by one when you need to analyze " +
       "or compare multiple files. Each file's content is returned with its " +
       "path as a reference. Failed reads for individual files won't stop " +
-      "the entire operation. Only works within allowed directories.",
+      "the entire operation. At most 10 paths per call, and each file is " +
+      "limited to 1 MiB. Only works within allowed directories.",
     inputSchema: {
       paths: z.array(z.string())
         .min(1)
+        .max(MAX_MULTIPLE_READ_PATHS, `Too many paths: at most ${MAX_MULTIPLE_READ_PATHS} files can be read at once`)
         .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories.")
     },
     outputSchema: { content: z.string() },
