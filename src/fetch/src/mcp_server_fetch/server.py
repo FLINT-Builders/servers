@@ -97,13 +97,13 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url:
     )
     robot_parser = Protego.parse(processed_robot_txt)
     if not robot_parser.can_fetch(str(url), user_agent):
+        # The robots.txt body is attacker-controlled, so it must never be echoed to the model.
         raise McpError(ErrorData(
             code=INTERNAL_ERROR,
             message=f"The sites robots.txt ({robot_txt_url}), specifies that autonomous fetching of this page is not allowed, "
             f"<useragent>{user_agent}</useragent>\n"
-            f"<url>{url}</url>"
-            f"<robots>\n{robot_txt}\n</robots>\n"
-            f"The assistant must let the user know that it failed to view the page. The assistant may provide further guidance based on the above information.\n"
+            f"<url>{url}</url>\n"
+            f"The assistant must let the user know that it failed to view the page.\n"
             f"The assistant can tell the user that they can try manually fetching the page by using the fetch prompt within their UI.",
         ))
 
