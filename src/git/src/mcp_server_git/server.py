@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Annotated, Any, Optional, Sequence
 from mcp.server import Server
 from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
@@ -19,22 +19,34 @@ from pydantic import BaseModel, Field
 
 # Default number of context lines to show in diff output
 DEFAULT_CONTEXT_LINES = 3
+# Upper bound on diff context lines; larger values let a caller make git emit
+# arbitrarily large portions of unchanged files.
+MAX_CONTEXT_LINES = 100
+
+ContextLines = Annotated[
+    int,
+    Field(
+        ge=0,
+        le=MAX_CONTEXT_LINES,
+        description=f"Number of context lines to show (0-{MAX_CONTEXT_LINES})",
+    ),
+]
 
 class GitStatus(BaseModel):
     repo_path: str
 
 class GitDiffUnstaged(BaseModel):
     repo_path: str
-    context_lines: int = DEFAULT_CONTEXT_LINES
+    context_lines: ContextLines = DEFAULT_CONTEXT_LINES
 
 class GitDiffStaged(BaseModel):
     repo_path: str
-    context_lines: int = DEFAULT_CONTEXT_LINES
+    context_lines: ContextLines = DEFAULT_CONTEXT_LINES
 
 class GitDiff(BaseModel):
     repo_path: str
     target: str
-    context_lines: int = DEFAULT_CONTEXT_LINES
+    context_lines: ContextLines = DEFAULT_CONTEXT_LINES
 
 class GitCommit(BaseModel):
     repo_path: str
@@ -111,19 +123,32 @@ class GitTools(str, Enum):
 def git_status(repo: git.Repo) -> str:
     return repo.git.status()
 
+def _unified_arg(context_lines: int) -> str:
+    if (
+        not isinstance(context_lines, int)
+        or isinstance(context_lines, bool)
+        or not 0 <= context_lines <= MAX_CONTEXT_LINES
+    ):
+        raise ValueError(
+            f"Invalid context_lines: {context_lines!r} - must be an integer "
+            f"between 0 and {MAX_CONTEXT_LINES}"
+        )
+    return f"--unified={context_lines}"
+
 def git_diff_unstaged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
-    return repo.git.diff(f"--unified={context_lines}")
+    return repo.git.diff(_unified_arg(context_lines))
 
 def git_diff_staged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
-    return repo.git.diff(f"--unified={context_lines}", "--cached")
+    return repo.git.diff(_unified_arg(context_lines), "--cached")
 
 def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
+    unified = _unified_arg(context_lines)
     # Defense in depth: reject targets starting with '-' to prevent flag injection,
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
     if target.startswith("-"):
         raise BadName(f"Invalid target: '{target}' - cannot start with '-'")
     repo.rev_parse(target)  # Validates target is a real git ref, throws BadName if not
-    return repo.git.diff(f"--unified={context_lines}", target)
+    return repo.git.diff(unified, target)
 
 def git_commit(repo: git.Repo, message: str) -> str:
     commit = repo.index.commit(message)
@@ -486,24 +511,27 @@ async def serve(repository: Path | None) -> None:
                 )]
 
             case GitTools.DIFF_UNSTAGED:
-                diff = git_diff_unstaged(repo, arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
+                unstaged_args = GitDiffUnstaged.model_validate(arguments)
+                diff = git_diff_unstaged(repo, unstaged_args.context_lines)
                 return [TextContent(
                     type="text",
                     text=f"Unstaged changes:\n{diff}"
                 )]
 
             case GitTools.DIFF_STAGED:
-                diff = git_diff_staged(repo, arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
+                staged_args = GitDiffStaged.model_validate(arguments)
+                diff = git_diff_staged(repo, staged_args.context_lines)
                 return [TextContent(
                     type="text",
                     text=f"Staged changes:\n{diff}"
                 )]
 
             case GitTools.DIFF:
-                diff = git_diff(repo, arguments["target"], arguments.get("context_lines", DEFAULT_CONTEXT_LINES))
+                diff_args = GitDiff.model_validate(arguments)
+                diff = git_diff(repo, diff_args.target, diff_args.context_lines)
                 return [TextContent(
                     type="text",
-                    text=f"Diff with {arguments['target']}:\n{diff}"
+                    text=f"Diff with {diff_args.target}:\n{diff}"
                 )]
 
             case GitTools.COMMIT:
