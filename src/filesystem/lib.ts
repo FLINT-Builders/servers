@@ -424,7 +424,9 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
   const fileHandle = await fs.open(filePath, 'r');
   try {
     const lines: string[] = [];
-    let buffer = '';
+    // Pieces of the current, not yet terminated line. Only newly decoded
+    // text is searched for newlines, so a long line is scanned once.
+    let partialLine: string[] = [];
     let bytesRead = 0;
     const chunk = Buffer.alloc(1024); // 1KB buffer
     const decoder = new StringDecoder('utf-8');
@@ -434,20 +436,22 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
       const result = await fileHandle.read(chunk, 0, chunk.length, bytesRead);
       if (result.bytesRead === 0) break; // End of file
       bytesRead += result.bytesRead;
-      buffer += decoder.write(chunk.subarray(0, result.bytesRead));
+      const text = decoder.write(chunk.subarray(0, result.bytesRead));
       
-      const newLineIndex = buffer.lastIndexOf('\n');
-      if (newLineIndex !== -1) {
-        const completeLines = buffer.slice(0, newLineIndex).split('\n');
-        buffer = buffer.slice(newLineIndex + 1);
-        for (const line of completeLines) {
-          lines.push(line);
-          if (lines.length >= numLines) break;
-        }
+      let start = 0;
+      let newLineIndex = text.indexOf('\n', start);
+      while (newLineIndex !== -1 && lines.length < numLines) {
+        partialLine.push(text.slice(start, newLineIndex));
+        lines.push(partialLine.join(''));
+        partialLine = [];
+        start = newLineIndex + 1;
+        newLineIndex = text.indexOf('\n', start);
       }
+      partialLine.push(text.slice(start));
     }
 
-    buffer += decoder.end();
+    partialLine.push(decoder.end());
+    const buffer = partialLine.join('');
     
     // If there is leftover content and we still need lines, add it
     if (buffer.length > 0 && lines.length < numLines) {
