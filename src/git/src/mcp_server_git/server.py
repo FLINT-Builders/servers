@@ -15,10 +15,13 @@ from mcp.types import (
 from enum import Enum
 import git
 from git.exc import BadName
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Default number of context lines to show in diff output
 DEFAULT_CONTEXT_LINES = 3
+
+DEFAULT_LOG_MAX_COUNT = 10
+MAX_LOG_MAX_COUNT = 100
 
 class GitStatus(BaseModel):
     repo_path: str
@@ -49,7 +52,12 @@ class GitReset(BaseModel):
 
 class GitLog(BaseModel):
     repo_path: str
-    max_count: int = 10
+    max_count: int = Field(
+        DEFAULT_LOG_MAX_COUNT,
+        ge=1,
+        le=MAX_LOG_MAX_COUNT,
+        description=f"Maximum number of commits to show (1-{MAX_LOG_MAX_COUNT})",
+    )
     start_timestamp: Optional[str] = Field(
         None,
         description="Start timestamp for filtering commits. Accepts: ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')"
@@ -58,6 +66,12 @@ class GitLog(BaseModel):
         None,
         description="End timestamp for filtering commits. Accepts: ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')"
     )
+
+    @field_validator("max_count", mode="before")
+    @classmethod
+    def _default_when_null(cls, value: Any) -> Any:
+        # GitPython drops a None max_count, which would walk the entire history.
+        return DEFAULT_LOG_MAX_COUNT if value is None else value
 
 class GitCreateBranch(BaseModel):
     repo_path: str
@@ -156,7 +170,16 @@ def git_reset(repo: git.Repo) -> str:
     repo.index.reset()
     return "All staged changes reset"
 
-def git_log(repo: git.Repo, max_count: int = 10, start_timestamp: Optional[str] = None, end_timestamp: Optional[str] = None) -> list[str]:
+def git_log(repo: git.Repo, max_count: int = DEFAULT_LOG_MAX_COUNT, start_timestamp: Optional[str] = None, end_timestamp: Optional[str] = None) -> list[str]:
+    # A missing or non-positive max_count makes GitPython walk the entire history
+    if (
+        not isinstance(max_count, int)
+        or isinstance(max_count, bool)
+        or not 1 <= max_count <= MAX_LOG_MAX_COUNT
+    ):
+        raise ValueError(
+            f"Invalid max_count: {max_count!r} - must be an integer between 1 and {MAX_LOG_MAX_COUNT}"
+        )
     # Defense in depth: reject timestamps starting with '-' to prevent flag injection
     if start_timestamp and start_timestamp.startswith("-"):
         raise ValueError(f"Invalid start_timestamp: '{start_timestamp}' - cannot start with '-'")
@@ -527,13 +550,13 @@ async def serve(repository: Path | None) -> None:
                     text=result
                 )]
 
-            # Update the LOG case:
             case GitTools.LOG:
+                log_args = GitLog.model_validate(arguments)
                 log = git_log(
                     repo,
-                    arguments.get("max_count", 10),
-                    arguments.get("start_timestamp"),
-                    arguments.get("end_timestamp")
+                    log_args.max_count,
+                    log_args.start_timestamp,
+                    log_args.end_timestamp,
                 )
                 return [TextContent(
                     type="text",
