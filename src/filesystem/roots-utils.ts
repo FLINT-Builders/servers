@@ -2,6 +2,7 @@ import { promises as fs, type Stats } from 'fs';
 import path from 'path';
 import os from 'os';
 import { normalizePath } from './path-utils.js';
+import { isPathWithinAllowedDirectories } from './path-validation.js';
 import type { Root } from '@modelcontextprotocol/sdk/types.js';
 import { fileURLToPath } from "url";
 
@@ -46,11 +47,18 @@ function formatDirectoryError(dir: string, error?: unknown, reason?: string): st
  * directory paths, validating that each path exists and is a directory.
  * Includes symlink resolution for security.
  * 
+ * When ceilingDirectories is non-empty, a root is accepted only if its resolved
+ * path is the same as, or inside, one of those directories. The resolved path
+ * that was checked is the one returned, so a symlinked root cannot be compared
+ * by one path and granted by another.
+ * 
  * @param requestedRoots - Array of root specifications with URI and optional name
+ * @param ceilingDirectories - Directories that bound every accepted root (empty for no bound)
  * @returns Promise resolving to array of validated directory paths
  */
 export async function getValidRootDirectories(
-  requestedRoots: readonly Root[]
+  requestedRoots: readonly Root[],
+  ceilingDirectories: readonly string[] = []
 ): Promise<string[]> {
   const validatedDirectories: string[] = [];
   
@@ -58,6 +66,14 @@ export async function getValidRootDirectories(
     const resolvedPath = await parseRootUri(requestedRoot.uri);
     if (!resolvedPath) {
       console.error(formatDirectoryError(requestedRoot.uri, undefined, 'invalid path or inaccessible'));
+      continue;
+    }
+
+    if (
+      ceilingDirectories.length > 0 &&
+      !isPathWithinAllowedDirectories(resolvedPath, [...ceilingDirectories])
+    ) {
+      console.error(formatDirectoryError(resolvedPath, undefined, 'root outside the command-line allowed directories'));
       continue;
     }
     
