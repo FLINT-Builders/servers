@@ -109,6 +109,18 @@ npm install
 npm run start:streamableHttp
 ```
 
+## HTTP transport settings
+
+The SSE and Streamable HTTP transports read these environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORT` | `3001` | Port to listen on. |
+| `EVERYTHING_HOST` | `127.0.0.1` | Interface to bind. Set to `0.0.0.0` to accept connections from other hosts. |
+| `EVERYTHING_MAX_SESSIONS` | `8` | Maximum concurrent sessions. New sessions are rejected with HTTP 503 while the limit is reached. |
+| `EVERYTHING_SESSION_IDLE_MS` | `600000` | Streamable HTTP only: sessions with no open request and no activity for this long are closed. |
+| `EVERYTHING_CORS_ORIGINS` | _(none)_ | Comma-separated list of browser origins allowed to call the server, e.g. `http://localhost:6274` for MCP Inspector direct connect mode. |
+
 ## Running as an installed package
 ### Install 
 ```shell

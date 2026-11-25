@@ -42,7 +42,12 @@
       - **GET** (SSE stream)
       - **DELETE** (termination)
     - Uses an event store for resumability and stores transports by `sessionId`.
-    - Calls `cleanup(sessionId)` on **DELETE**.
+    - Calls `cleanup(sessionId)` when the transport closes: on **DELETE**, when an idle session is swept, or on `SIGINT`.
+  - **HTTP transports (SSE and Streamable HTTP)**:
+    - Bind to `127.0.0.1` unless `EVERYTHING_HOST` is set.
+    - Reject new sessions with HTTP 503 once `EVERYTHING_MAX_SESSIONS` (default 8) are open.
+    - Send CORS headers only to origins listed in `EVERYTHING_CORS_ORIGINS`.
+    - Streamable HTTP closes sessions idle for `EVERYTHING_SESSION_IDLE_MS` (default 600000).
 
 ## 3. The Server Factory
 
