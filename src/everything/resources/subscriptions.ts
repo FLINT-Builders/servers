@@ -90,6 +90,7 @@ export const setSubscriptionHandlers = (server: McpServer) => {
       if (subscriptions.has(uri)) {
         const subscribers = subscriptions.get(uri) as Set<string>;
         if (subscribers.has(sessionId)) subscribers.delete(sessionId);
+        if (subscribers.size === 0) subscriptions.delete(uri);
       }
       return {};
     }
@@ -164,5 +165,20 @@ export const stopSimulatedResourceUpdates = (sessionId?: string) => {
     const subsUpdateInterval = subsUpdateIntervals.get(sessionId);
     clearInterval(subsUpdateInterval);
     subsUpdateIntervals.delete(sessionId);
+  }
+};
+
+/**
+ * Removes a session from every resource subscription list.
+ *
+ * Called when a session ends so subscriptions do not outlive it.
+ * Session ID can be undefined for stdio.
+ *
+ * @param {string} [sessionId]
+ */
+export const removeSessionSubscriptions = (sessionId?: string) => {
+  for (const [uri, subscribers] of subscriptions) {
+    subscribers.delete(sessionId);
+    if (subscribers.size === 0) subscriptions.delete(uri);
   }
 };
