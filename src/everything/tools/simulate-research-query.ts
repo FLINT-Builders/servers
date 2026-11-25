@@ -41,9 +41,6 @@ interface ResearchState {
   result?: CallToolResult;
 }
 
-// Map to store research state per task
-const researchStates = new Map<string, ResearchState>();
-
 /**
  * Runs the background research process.
  * Updates task status as it progresses through stages.
@@ -53,6 +50,7 @@ const researchStates = new Map<string, ResearchState>();
  * This works on all transports (STDIO, SSE, Streamable HTTP).
  */
 async function runResearchProcess(
+  state: ResearchState,
   taskId: string,
   args: z.infer<typeof SimulateResearchQuerySchema>,
   taskStore: {
@@ -70,9 +68,6 @@ async function runResearchProcess(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   sendRequest: any
 ): Promise<void> {
-  const state = researchStates.get(taskId);
-  if (!state) return;
-
   // Process each stage
   for (let i = state.currentStage; i < STAGES.length; i++) {
     state.currentStage = i;
@@ -234,6 +229,9 @@ ${
  * @param {McpServer} server - The McpServer instance where the tool will be registered.
  */
 export const registerSimulateResearchQueryTool = (server: McpServer) => {
+  // Research state per task for this server instance
+  const researchStates = new Map<string, ResearchState>();
+
   // Check if client supports elicitation (needed for input_required flow)
   const clientCapabilities = server.server.getClientCapabilities() || {};
   const clientSupportsElicitation: boolean =
@@ -281,6 +279,7 @@ export const registerSimulateResearchQueryTool = (server: McpServer) => {
         // Start background research (don't await - runs asynchronously)
         // Pass sendRequest for elicitation (queued via task message queue, works on all transports)
         runResearchProcess(
+          state,
           task.taskId,
           validatedArgs,
           extra.taskStore,

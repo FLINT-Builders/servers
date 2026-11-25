@@ -10,6 +10,38 @@ export const roots: Map<string | undefined, Root[]> = new Map<
   Root[]
 >();
 
+// Limits on the client-supplied roots kept for a session
+const MAX_ROOTS = 32;
+const MAX_ROOT_FIELD_LENGTH = 1024;
+
+/**
+ * Copy the client's roots list into the bounded form kept for the session.
+ *
+ * Roots whose URI or name exceed `MAX_ROOT_FIELD_LENGTH` are dropped, at most
+ * `MAX_ROOTS` roots are kept, and only the `uri` and `name` fields are copied.
+ *
+ * @param {Root[]} clientRoots - The roots list returned by the client.
+ * @returns {Root[]} The bounded roots list.
+ */
+const boundRoots = (clientRoots: Root[]): Root[] =>
+  clientRoots
+    .filter(
+      (root) =>
+        root.uri.length <= MAX_ROOT_FIELD_LENGTH &&
+        (root.name?.length ?? 0) <= MAX_ROOT_FIELD_LENGTH
+    )
+    .slice(0, MAX_ROOTS)
+    .map(({ uri, name }) => (name === undefined ? { uri } : { uri, name }));
+
+/**
+ * Forget the roots list stored for a session.
+ *
+ * @param {string} [sessionId] - The id of the session that has ended.
+ */
+export const clearRoots = (sessionId?: string) => {
+  roots.delete(sessionId);
+};
+
 /**
  * Get the latest the client roots list for the session.
  *
@@ -34,21 +66,35 @@ export const syncRoots = async (server: McpServer, sessionId?: string) => {
 
   // Fetch the roots list for this client
   if (clientSupportsRoots) {
+    const transport = server.server.transport;
+
     // Function to request the updated roots list from the client
     const requestRoots = async () => {
       try {
         // Request the updated roots list from the client
         const response = await server.server.listRoots();
+
+        // Discard a response for a session that has since closed, so it
+        // cannot be stored after the session's cleanup has run
+        if (!transport || server.server.transport !== transport) return;
+
         if (response && "roots" in response) {
-          // Store the roots list for this client
-          roots.set(sessionId, response.roots);
+          // Store the bounded roots list for this client
+          const sessionRoots = boundRoots(response.roots);
+          roots.set(sessionId, sessionRoots);
+
+          const dropped = response.roots.length - sessionRoots.length;
 
           // Notify the client of roots received
           await server.sendLoggingMessage(
             {
               level: "info",
               logger: "everything-server",
-              data: `Roots updated: ${response?.roots?.length} root(s) received from client`,
+              data:
+                `Roots updated: ${response.roots.length} root(s) received from client` +
+                (dropped > 0
+                  ? `, ${dropped} not kept (limit ${MAX_ROOTS} roots, ${MAX_ROOT_FIELD_LENGTH} characters per URI or name)`
+                  : ""),
             },
             sessionId
           );

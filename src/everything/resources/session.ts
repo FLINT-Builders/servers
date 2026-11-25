@@ -5,8 +5,13 @@ import { Resource, ResourceLink } from "@modelcontextprotocol/sdk/types.js";
  * Tracks registered session resources by URI to allow updating/removing on re-registration.
  * This prevents "Resource already registered" errors when a tool creates a resource
  * with the same URI multiple times during a session.
+ *
+ * Keyed weakly by server instance so that each session's resources are released with its server.
  */
-const registeredResources = new Map<string, RegisteredResource>();
+const registeredResources = new WeakMap<
+  McpServer,
+  Map<string, RegisteredResource>
+>();
 
 /**
  * Generates a session-scoped resource URI string based on the provided resource name.
@@ -54,11 +59,17 @@ export const registerSessionResource = (
           blob: payload,
         };
 
+  let serverResources = registeredResources.get(server);
+  if (!serverResources) {
+    serverResources = new Map<string, RegisteredResource>();
+    registeredResources.set(server, serverResources);
+  }
+
   // Check if a resource with this URI is already registered and remove it
-  const existingResource = registeredResources.get(uri);
+  const existingResource = serverResources.get(uri);
   if (existingResource) {
     existingResource.remove();
-    registeredResources.delete(uri);
+    serverResources.delete(uri);
   }
 
   // Register file resource
@@ -74,7 +85,7 @@ export const registerSessionResource = (
   );
 
   // Track the registered resource for potential future removal
-  registeredResources.set(uri, registeredResource);
+  serverResources.set(uri, registeredResource);
 
   return { type: "resource_link", ...resource };
 };
