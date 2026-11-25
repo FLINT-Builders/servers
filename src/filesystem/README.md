@@ -26,7 +26,7 @@ mcp-server-filesystem /path/to/dir1 /path/to/dir2
 ### Method 2: MCP Roots (Recommended)
 MCP clients that support [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically update the Allowed directories. 
 
-Roots notified by Client to Server, completely replace any server-side Allowed directories when provided.
+Roots notified by Client to Server replace the server-side Allowed directories when provided. If the server was started with command-line directories, those directories are a hard ceiling: a client root is accepted only when its resolved path (after following symlinks) is the same as, or inside, one of them. Roots outside the command-line directories are ignored, both at initialization and on `roots/list_changed`. If no client root falls within them, the current Allowed directories are kept.
 
 **Important**: If server starts without command-line arguments AND client doesn't support roots protocol (or provides empty roots), the server will throw an error during initialization.
 
@@ -47,9 +47,10 @@ The server's directory access control follows this flow:
 3. **Roots Protocol Handling** (if client supports roots)
    - **On initialization**: Server requests roots from client via `roots/list`
    - Client responds with its configured roots
-   - Server replaces ALL allowed directories with client's roots
+   - Server replaces allowed directories with the client's roots
+   - If command-line directories were provided, only roots within them are accepted; roots outside are ignored
    - **On runtime updates**: Client can send `notifications/roots/list_changed`
-   - Server requests updated roots and replaces allowed directories again
+   - Server requests updated roots and replaces allowed directories again, under the same command-line ceiling
 
 4. **Fallback Behavior** (if client doesn't support roots)
    - Server continues using command-line directories only

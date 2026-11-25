@@ -90,6 +90,11 @@ if (accessibleDirectories.length === 0 && allowedDirectories.length > 0) {
 
 allowedDirectories = accessibleDirectories;
 
+// Command-line directories are a hard ceiling: client roots may narrow access
+// within them but never widen it. Empty only when started without arguments,
+// in which case client roots define the allowlist.
+const commandLineDirectories: readonly string[] = Object.freeze([...allowedDirectories]);
+
 // Initialize the global allowedDirectories in lib.ts
 setAllowedDirectories(allowedDirectories);
 
@@ -723,17 +728,17 @@ server.registerTool(
 
 // Updates allowed directories based on MCP client roots
 async function updateAllowedDirectoriesFromRoots(requestedRoots: Root[]) {
-  const validatedRootDirs = await getValidRootDirectories(requestedRoots);
+  const validatedRootDirs = await getValidRootDirectories(requestedRoots, commandLineDirectories);
   if (validatedRootDirs.length > 0) {
     allowedDirectories = [...validatedRootDirs];
     setAllowedDirectories(allowedDirectories); // Update the global state in lib.ts
-    console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories`);
+    console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories:`, allowedDirectories);
   } else {
-    console.error("No valid root directories provided by client");
+    console.error("No valid root directories provided by client, keeping allowed directories:", allowedDirectories);
   }
 }
 
-// Handles dynamic roots updates during runtime, when client sends "roots/list_changed" notification, server fetches the updated roots and replaces all allowed directories with the new roots.
+// Handles dynamic roots updates during runtime, when client sends "roots/list_changed" notification, server fetches the updated roots and replaces allowed directories with the new roots that fall within the command-line directories.
 server.server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
   try {
     // Request the updated roots list from the client
@@ -777,6 +782,8 @@ async function runServer() {
   console.error("Secure MCP Filesystem Server running on stdio");
   if (allowedDirectories.length === 0) {
     console.error("Started without allowed directories - waiting for client to provide roots via MCP protocol");
+  } else {
+    console.error("Allowed directories (client roots may only narrow these):", allowedDirectories);
   }
 }
 
