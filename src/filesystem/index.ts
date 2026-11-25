@@ -26,6 +26,7 @@ import {
   applyFileEdits,
   tailFile,
   headFile,
+  MAX_HEAD_SCAN_BYTES,
   setAllowedDirectories,
 } from './lib.js';
 
@@ -94,10 +95,15 @@ allowedDirectories = accessibleDirectories;
 setAllowedDirectories(allowedDirectories);
 
 // Schema definitions
+const TailLinesSchema = z.number().int().positive().optional()
+  .describe('If provided, returns only the last N lines of the file');
+const HeadLinesSchema = z.number().int().positive().optional()
+  .describe(`If provided, returns only the first N lines of the file, reading at most ${MAX_HEAD_SCAN_BYTES} bytes`);
+
 const ReadTextFileArgsSchema = z.object({
   path: z.string(),
-  tail: z.number().optional().describe('If provided, returns only the last N lines of the file'),
-  head: z.number().optional().describe('If provided, returns only the first N lines of the file')
+  tail: TailLinesSchema,
+  head: HeadLinesSchema
 });
 
 const ReadMediaFileArgsSchema = z.object({
@@ -237,8 +243,8 @@ server.registerTool(
       "Only works within allowed directories.",
     inputSchema: {
       path: z.string(),
-      tail: z.number().optional().describe("If provided, returns only the last N lines of the file"),
-      head: z.number().optional().describe("If provided, returns only the first N lines of the file")
+      tail: TailLinesSchema,
+      head: HeadLinesSchema
     },
     outputSchema: { content: z.string() },
     annotations: { readOnlyHint: true, openWorldHint: false }

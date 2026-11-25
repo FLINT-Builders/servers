@@ -385,12 +385,13 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
       if (!bytesRead) break;
 
       const readData = Buffer.from(chunk.subarray(0, bytesRead));
-      chunks.unshift(readData);
+      chunks.push(readData);
       for (const byte of readData) {
         if (byte === 0x0a) newlinesFound++;
       }
     }
 
+    chunks.reverse();
     const text = normalizeLineEndings(Buffer.concat(chunks).toString('utf-8'));
     return text.split('\n').slice(-numLines).join('\n');
   } finally {
@@ -398,42 +399,74 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
   }
 }
 
-// New function to get the first N lines of a file
-export async function headFile(filePath: string, numLines: number): Promise<string> {
+// Upper bound on how much of a file a head read scans and returns, so a file
+// with very long lines or a huge line count cannot stall the server.
+export const MAX_HEAD_SCAN_BYTES = 1024 * 1024;
+
+// Get the first N lines of a file, reading at most maxBytes bytes. If the
+// budget is reached first, the lines found so far (including a partial last
+// line) are returned.
+export async function headFile(
+  filePath: string,
+  numLines: number,
+  maxBytes: number = MAX_HEAD_SCAN_BYTES
+): Promise<string> {
+  if (!Number.isSafeInteger(numLines) || numLines <= 0) {
+    throw new Error('Line count must be a positive integer');
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error('Byte budget must be a positive integer');
+  }
+
   const fileHandle = await fs.open(filePath, 'r');
   try {
-    const lines: string[] = [];
-    let buffer = '';
-    let bytesRead = 0;
-    const chunk = Buffer.alloc(1024); // 1KB buffer
-    const decoder = new StringDecoder('utf-8');
-    
-    // Read chunks and count lines until we have enough or reach EOF
-    while (lines.length < numLines) {
-      const result = await fileHandle.read(chunk, 0, chunk.length, bytesRead);
-      if (result.bytesRead === 0) break; // End of file
-      bytesRead += result.bytesRead;
-      buffer += decoder.write(chunk.subarray(0, result.bytesRead));
-      
-      const newLineIndex = buffer.lastIndexOf('\n');
-      if (newLineIndex !== -1) {
-        const completeLines = buffer.slice(0, newLineIndex).split('\n');
-        buffer = buffer.slice(newLineIndex + 1);
-        for (const line of completeLines) {
-          lines.push(line);
-          if (lines.length >= numLines) break;
-        }
+    const chunks: Buffer[] = [];
+    const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes));
+    let totalBytes = 0;
+    let newlinesFound = 0;
+    let endOffset = -1;
+    let reachedEof = false;
+
+    while (totalBytes < maxBytes) {
+      const toRead = Math.min(chunk.length, maxBytes - totalBytes);
+      const result = await fileHandle.read(chunk, 0, toRead, totalBytes);
+      const bytesRead = Math.min(result.bytesRead, toRead);
+      if (bytesRead === 0) {
+        reachedEof = true;
+        break;
       }
+
+      const data = Buffer.from(chunk.subarray(0, bytesRead));
+      let searchFrom = 0;
+      while (searchFrom < data.length) {
+        const index = data.indexOf(0x0a, searchFrom);
+        if (index === -1) break;
+        newlinesFound++;
+        if (newlinesFound >= numLines) {
+          endOffset = totalBytes + index;
+          break;
+        }
+        searchFrom = index + 1;
+      }
+
+      chunks.push(data);
+      totalBytes += bytesRead;
+      if (endOffset !== -1) break;
     }
 
-    buffer += decoder.end();
-    
-    // If there is leftover content and we still need lines, add it
-    if (buffer.length > 0 && lines.length < numLines) {
-      lines.push(buffer);
+    let bytes = Buffer.concat(chunks, totalBytes);
+    const decoder = new StringDecoder('utf-8');
+    if (endOffset !== -1) {
+      return decoder.end(bytes.subarray(0, endOffset));
     }
-    
-    return lines.join('\n');
+
+    // Without a terminating newline the final line is whatever remains.
+    if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0a) {
+      bytes = bytes.subarray(0, bytes.length - 1);
+    }
+    // When the budget cut the read short, drop a trailing partial UTF-8
+    // sequence instead of emitting a replacement character for it.
+    return reachedEof ? decoder.end(bytes) : decoder.write(bytes);
   } finally {
     await fileHandle.close();
   }
