@@ -112,6 +112,8 @@ The server's directory access control follows this flow:
       - `newText` (string): Text to replace with
     - `dryRun` (boolean): Preview changes without applying (default: false)
   - Returns detailed diff and match information for dry runs, otherwise applies changes
+  - Rejects a call whose edits would process more than 256 Mi characters in total (the current file length plus each edit's text, counted once per edit)
+  - Very large rewrites are shown as a single diff hunk rather than a minimal diff
   - Best Practice: Always use dryRun first to preview changes before applying them
 
 - **create_directory**
