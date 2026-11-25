@@ -1,4 +1,5 @@
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from mcp.server import Server
@@ -253,6 +254,73 @@ def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None
         )
 
 
+class BoundRepository:
+    """The allowed repository, opened once at startup and pinned to its resolved paths.
+
+    Tool calls act on this object instead of reopening the requested path, so a
+    ``.git`` file or ``.git`` symlink that names another repository cannot
+    redirect them. Nested repositories and submodules are refused for the same
+    reason: their git directories can point anywhere.
+    """
+
+    def __init__(self, repository: Path) -> None:
+        self.path = repository
+        self.repo = git.Repo(repository.resolve())
+        self.git_dir = Path(self.repo.git_dir).resolve()
+        self.common_dir = Path(self.repo.common_dir).resolve()
+        self.work_tree = (
+            Path(self.repo.working_tree_dir).resolve()
+            if self.repo.working_tree_dir is not None
+            else None
+        )
+
+        environment = {
+            "GIT_DIR": str(self.git_dir),
+            "GIT_COMMON_DIR": str(self.common_dir),
+        }
+        if self.work_tree is not None:
+            environment["GIT_WORK_TREE"] = str(self.work_tree)
+        self.repo.git.update_environment(**environment)
+
+        self._identity = self._current_identity()
+
+    def _bound_paths(self) -> list[Path]:
+        paths = [self.git_dir, self.common_dir]
+        if self.work_tree is not None:
+            paths.append(self.work_tree)
+        return paths
+
+    def _current_identity(self) -> list[tuple[int, int]]:
+        identity = []
+        for path in self._bound_paths():
+            st = os.stat(path, follow_symlinks=False)
+            identity.append((st.st_dev, st.st_ino))
+        return identity
+
+    def open(self, repo_path: Path) -> git.Repo:
+        """Return the bound repository if repo_path names it, otherwise raise."""
+        validate_repo_path(repo_path, self.path)
+
+        try:
+            resolved = repo_path.resolve()
+        except (OSError, RuntimeError):
+            raise ValueError(f"Invalid path: {repo_path}")
+        if resolved not in (self.work_tree, self.git_dir):
+            raise ValueError(
+                f"Repository path '{repo_path}' is not the allowed repository '{self.path}'"
+            )
+
+        try:
+            unchanged = self._current_identity() == self._identity
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            raise ValueError(
+                f"The allowed repository '{self.path}' was moved or replaced since the server started"
+            )
+        return self.repo
+
+
 def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, not_contains: str | None = None) -> str:
     # Defense in depth: reject values starting with '-' to prevent flag injection
     if contains and contains.startswith("-"):
@@ -291,9 +359,10 @@ def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, no
 async def serve(repository: Path | None) -> None:
     logger = logging.getLogger(__name__)
 
+    bound: BoundRepository | None = None
     if repository is not None:
         try:
-            git.Repo(repository)
+            bound = BoundRepository(repository)
             logger.info(f"Using repository at {repository}")
         except git.InvalidGitRepositoryError:
             logger.error(f"{repository} is not a valid Git repository")
@@ -471,11 +540,10 @@ async def serve(repository: Path | None) -> None:
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         repo_path = Path(arguments["repo_path"])
 
-        # Validate repo_path is within allowed repository
-        validate_repo_path(repo_path, repository)
-
-        # For all commands, we need an existing repo
-        repo = git.Repo(repo_path)
+        if bound is not None:
+            repo = bound.open(repo_path)
+        else:
+            repo = git.Repo(repo_path)
 
         match name:
             case GitTools.STATUS:
