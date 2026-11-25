@@ -24,35 +24,42 @@ const transports: Map<string, SSEServerTransport> = new Map<
 
 // Handle GET requests for new SSE streams
 app.get("/sse", async (req, res) => {
-  let transport: SSEServerTransport;
-  const { server, cleanup } = createServer();
-
-  // Session Id should not exist for GET /sse requests
+  // Session Id should not exist for GET /sse requests. The session's stream
+  // lives on its original response, so any other request must be finished here.
   if (req?.query?.sessionId) {
-    const sessionId = req?.query?.sessionId as string;
-    transport = transports.get(sessionId) as SSEServerTransport;
     console.error(
       "Client Reconnecting? This shouldn't happen; when client has a sessionId, GET /sse should not be called again.",
-      transport.sessionId
+      req.query.sessionId
     );
-  } else {
-    // Create and store transport for the new session
-    transport = new SSEServerTransport("/message", res);
-    transports.set(transport.sessionId, transport);
-
-    // Connect server to transport
-    await server.connect(transport);
-    const sessionId = transport.sessionId;
-    console.error("Client Connected: ", sessionId);
-
-    // Handle close of connection
-    server.server.onclose = async () => {
-      const sessionId = transport.sessionId;
-      console.error("Client Disconnected: ", sessionId);
-      transports.delete(sessionId);
-      cleanup(sessionId);
-    };
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32000,
+        message: "Bad Request: GET /sse must not include a sessionId",
+      },
+      id: null,
+    });
+    return;
   }
+
+  const { server, cleanup } = createServer();
+
+  // Create and store transport for the new session
+  const transport = new SSEServerTransport("/message", res);
+  transports.set(transport.sessionId, transport);
+
+  // Connect server to transport
+  await server.connect(transport);
+  const sessionId = transport.sessionId;
+  console.error("Client Connected: ", sessionId);
+
+  // Handle close of connection
+  server.server.onclose = async () => {
+    const sessionId = transport.sessionId;
+    console.error("Client Disconnected: ", sessionId);
+    transports.delete(sessionId);
+    cleanup(sessionId);
+  };
 });
 
 // Handle POST requests for client messages
@@ -67,6 +74,14 @@ app.post("/message", async (req, res) => {
     await transport.handlePostMessage(req, res);
   } else {
     console.error(`No transport found for sessionId ${sessionId}`);
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32000,
+        message: "Bad Request: No valid session ID provided",
+      },
+      id: null,
+    });
   }
 });
 
