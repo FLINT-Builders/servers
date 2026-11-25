@@ -27,6 +27,9 @@ import {
   tailFile,
   headFile,
   setAllowedDirectories,
+  // Constants
+  MAX_TAIL_LINES,
+  MAX_TAIL_BYTES,
 } from './lib.js';
 
 // Command line argument parsing
@@ -96,7 +99,7 @@ setAllowedDirectories(allowedDirectories);
 // Schema definitions
 const ReadTextFileArgsSchema = z.object({
   path: z.string(),
-  tail: z.number().optional().describe('If provided, returns only the last N lines of the file'),
+  tail: z.number().optional().describe(`If provided, returns only the last N lines of the file (at most ${MAX_TAIL_LINES} lines, read from the last ${MAX_TAIL_BYTES} bytes)`),
   head: z.number().optional().describe('If provided, returns only the first N lines of the file')
 });
 
@@ -237,7 +240,7 @@ server.registerTool(
       "Only works within allowed directories.",
     inputSchema: {
       path: z.string(),
-      tail: z.number().optional().describe("If provided, returns only the last N lines of the file"),
+      tail: z.number().optional().describe(`If provided, returns only the last N lines of the file (at most ${MAX_TAIL_LINES} lines, read from the last ${MAX_TAIL_BYTES} bytes)`),
       head: z.number().optional().describe("If provided, returns only the first N lines of the file")
     },
     outputSchema: { content: z.string() },

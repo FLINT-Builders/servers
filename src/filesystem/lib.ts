@@ -360,9 +360,18 @@ export async function applyFileEdits(
   return formattedDiff;
 }
 
-// Memory-efficient implementation to get the last N lines of a file
+export const MAX_TAIL_LINES = 10_000;
+export const MAX_TAIL_BYTES = 1024 * 1024;
+
+// Memory-efficient implementation to get the last N lines of a file.
+// Returns at most MAX_TAIL_LINES lines and never reads more than
+// MAX_TAIL_BYTES from the end of the file, so a line longer than that
+// is truncated at its start.
 export async function tailFile(filePath: string, numLines: number): Promise<string> {
   const CHUNK_SIZE = 1024; // Read 1KB at a time
+  const lineLimit = Math.min(Math.floor(numLines), MAX_TAIL_LINES);
+  if (!(lineLimit > 0)) return '';
+
   const stats = await fs.stat(filePath);
   const fileSize = stats.size;
   
@@ -371,28 +380,40 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
   // Open file for reading
   const fileHandle = await fs.open(filePath, 'r');
   try {
+    // Chunks are collected newest-first and reversed once at the end;
+    // prepending each chunk would make the scan quadratic.
     const chunks: Buffer[] = [];
+    const scanStart = Math.max(0, fileSize - MAX_TAIL_BYTES);
     let position = fileSize;
-    const chunk = Buffer.alloc(CHUNK_SIZE);
     let newlinesFound = 0;
     
     // Read chunks from the end of the file until we have enough lines
-    while (position > 0 && newlinesFound < numLines) {
-      const size = Math.min(CHUNK_SIZE, position);
+    while (position > scanStart && newlinesFound < lineLimit) {
+      const size = Math.min(CHUNK_SIZE, position - scanStart);
       position -= size;
       
+      const chunk = Buffer.alloc(size);
       const { bytesRead } = await fileHandle.read(chunk, 0, size, position);
       if (!bytesRead) break;
 
-      const readData = Buffer.from(chunk.subarray(0, bytesRead));
-      chunks.unshift(readData);
+      const readData = chunk.subarray(0, bytesRead);
+      chunks.push(readData);
       for (const byte of readData) {
         if (byte === 0x0a) newlinesFound++;
       }
     }
 
-    const text = normalizeLineEndings(Buffer.concat(chunks).toString('utf-8'));
-    return text.split('\n').slice(-numLines).join('\n');
+    chunks.reverse();
+    let data = Buffer.concat(chunks);
+    if (position > 0) {
+      // The scan may have stopped inside a multi-byte UTF-8 sequence.
+      let start = 0;
+      while (start < data.length && start < 3 && (data[start] & 0xc0) === 0x80) start++;
+      data = data.subarray(start);
+    }
+
+    const text = normalizeLineEndings(data.toString('utf-8'));
+    return text.split('\n').slice(-lineLimit).join('\n');
   } finally {
     await fileHandle.close();
   }
