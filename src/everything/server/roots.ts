@@ -11,6 +11,15 @@ export const roots: Map<string | undefined, Root[]> = new Map<
 >();
 
 /**
+ * Forget the cached roots list for a session that has ended.
+ *
+ * @param {string} [sessionId] - The session whose roots should be removed.
+ */
+export const clearRoots = (sessionId?: string) => {
+  roots.delete(sessionId);
+};
+
+/**
  * Get the latest the client roots list for the session.
  *
  * - Request and cache the roots list for the session if it has not been fetched before.
