@@ -106,7 +106,12 @@ async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<strin
     return absolutePath;
   }
 
+  // The allowed directory may have been replaced by a symlink after it was
+  // authorized, so its current real path must still be inside the allowlist.
   let currentPath = await fs.realpath(allowedDirectory);
+  if (!isPathWithinAllowedDirectories(normalizePath(currentPath), allowedDirectories)) {
+    throw new Error(`Access denied - symlink target outside allowed directories: ${currentPath} not in ${allowedDirectories.join(', ')}`);
+  }
   const relativeParts = path.relative(allowedDirectory, absolutePath).split(path.sep).filter(Boolean);
 
   for (let index = 0; index < relativeParts.length; index++) {
