@@ -202,7 +202,23 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
   return await fs.readFile(filePath, encoding as BufferEncoding);
 }
 
+// Upper bound, in UTF-8 bytes, on any body written by writeFileContent or
+// applyFileEdits, so a single tool call cannot fill the backing disk.
+export const MAX_FILE_WRITE_BYTES = 1024 * 1024;
+
+// Measured in UTF-8 bytes, the encoding every write below uses, because a
+// string's character length understates the bytes written for non-ASCII text.
+function assertWithinWriteLimit(text: string, description: string): void {
+  const byteLength = Buffer.byteLength(text, 'utf-8');
+  if (byteLength > MAX_FILE_WRITE_BYTES) {
+    throw new Error(
+      `${description} is ${byteLength} bytes, which exceeds the maximum of ${MAX_FILE_WRITE_BYTES} bytes`
+    );
+  }
+}
+
 export async function writeFileContent(filePath: string, content: string): Promise<void> {
+  assertWithinWriteLimit(content, 'File content');
   try {
     // Security: 'wx' flag ensures exclusive creation - fails if file/symlink exists,
     // preventing writes through pre-existing symlinks
@@ -267,6 +283,10 @@ export async function applyFileEdits(
   edits: FileEdit[],
   dryRun: boolean = false
 ): Promise<string> {
+  edits.forEach((edit, index) => {
+    assertWithinWriteLimit(edit.newText, `newText of edit ${index + 1}`);
+  });
+
   // Read file content and normalize line endings
   const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
 
@@ -322,6 +342,8 @@ export async function applyFileEdits(
       throw new Error(`Could not find exact match for edit:\n${edit.oldText}`);
     }
   }
+
+  assertWithinWriteLimit(modifiedContent, 'Edited file content');
 
   // Create unified diff
   const diff = createUnifiedDiff(content, modifiedContent, filePath);
