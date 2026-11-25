@@ -24,14 +24,14 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Shows changes in working directory not yet staged
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `context_lines` (number, optional): Number of context lines to show (default: 3)
+     - `context_lines` (number, optional): Number of context lines to show, 0-100 (default: 3)
    - Returns: Diff output of unstaged changes
 
 3. `git_diff_staged`
    - Shows changes that are staged for commit
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `context_lines` (number, optional): Number of context lines to show (default: 3)
+     - `context_lines` (number, optional): Number of context lines to show, 0-100 (default: 3)
    - Returns: Diff output of staged changes
 
 4. `git_diff`
@@ -39,7 +39,7 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `target` (string): Target branch or commit to compare with
-     - `context_lines` (number, optional): Number of context lines to show (default: 3)
+     - `context_lines` (number, optional): Number of context lines to show, 0-100 (default: 3)
    - Returns: Diff output comparing current state with target
 
 5. `git_commit`
