@@ -61,11 +61,11 @@ const config = {
  * which would otherwise loop forever (throw -> client satisfies prerequisite ->
  * retry -> throw -> ...).
  *
- * Demo simplification: entries are only removed on a recognized retry, so a
- * client that triggers the error path and never retries leaves its key behind.
- * That is acceptable for this reference server; a production implementation
- * serving many long-lived sessions should evict entries (e.g. a
- * `Map<string, timestamp>` with TTL-based cleanup).
+ * Entries are removed on a recognized retry or when the session ends
+ * (`clearIssuedErrorPathElicitations`). A long-lived session that triggers the
+ * error path and never retries keeps its keys until it closes; a production
+ * implementation should also evict entries (e.g. a `Map<string, timestamp>`
+ * with TTL-based cleanup).
  */
 const issuedErrorPathElicitations = new Set<string>();
 
@@ -75,6 +75,18 @@ const issuedErrorPathElicitations = new Set<string>();
  */
 export const __resetIssuedErrorPathElicitations = () =>
   issuedErrorPathElicitations.clear();
+
+/**
+ * Forget the error-path markers recorded for a session that has ended.
+ *
+ * @param {string} [sessionId] - The id of the session that has ended.
+ */
+export const clearIssuedErrorPathElicitations = (sessionId?: string) => {
+  const prefix = `${sessionId ?? "default"}\u0000`;
+  for (const key of issuedErrorPathElicitations) {
+    if (key.startsWith(prefix)) issuedErrorPathElicitations.delete(key);
+  }
+};
 
 /**
  * Registers the 'trigger-url-elicitation' tool.

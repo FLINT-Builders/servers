@@ -19,9 +19,6 @@ const config = {
   },
 };
 
-// Track enabled clients by session id
-const clients: Set<string | undefined> = new Set<string | undefined>();
-
 /**
  * Registers the `toggle-subscriber-updates` tool.
  *
@@ -38,6 +35,9 @@ const clients: Set<string | undefined> = new Set<string | undefined>();
  * @param {McpServer} server - The McpServer instance where the tool will be registered.
  */
 export const registerToggleSubscriberUpdatesTool = (server: McpServer) => {
+  // Track enabled clients by session id for this server instance
+  const clients: Set<string | undefined> = new Set<string | undefined>();
+
   server.registerTool(
     name,
     config,
