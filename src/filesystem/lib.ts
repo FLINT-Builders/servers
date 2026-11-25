@@ -3,7 +3,7 @@ import path from "path";
 import os from 'os';
 import { randomBytes } from 'crypto';
 import { StringDecoder } from 'string_decoder';
-import { diffLines, createTwoFilesPatch } from 'diff';
+import { diffLines, createTwoFilesPatch, formatPatch, type StructuredPatchHunk } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
 import { isPathWithinAllowedDirectories } from './path-validation.js';
@@ -58,6 +58,12 @@ export function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, '\n');
 }
 
+// Myers diff is O((N+M)·D), so a large rewrite of a large file would stall the
+// server; past these bounds we fall back to a single coarse hunk.
+const MAX_DIFF_EDIT_LENGTH = 2_000;
+const MAX_DIFF_TIME_MS = 1_000;
+const DIFF_CONTEXT_LINES = 4;
+
 export function createUnifiedDiff(originalContent: string, newContent: string, filepath: string = 'file'): string {
   // Ensure consistent line endings for diff
   const normalizedOriginal = normalizeLineEndings(originalContent);
@@ -69,8 +75,77 @@ export function createUnifiedDiff(originalContent: string, newContent: string, f
     normalizedOriginal,
     normalizedNew,
     'original',
-    'modified'
-  );
+    'modified',
+    { maxEditLength: MAX_DIFF_EDIT_LENGTH, timeout: MAX_DIFF_TIME_MS }
+  ) ?? createSingleHunkDiff(normalizedOriginal, normalizedNew, filepath);
+}
+
+/** Splits text into lines that keep their trailing '\n', as jsdiff tokenizes them. */
+function splitDiffLines(text: string): string[] {
+  if (text === '') return [];
+  const lines = text.split('\n').map((line) => line + '\n');
+  if (text.endsWith('\n')) {
+    lines.pop();
+  } else {
+    lines[lines.length - 1] = lines[lines.length - 1].slice(0, -1);
+  }
+  return lines;
+}
+
+/** Linear-time unified diff that replaces everything between the common leading and trailing lines. */
+function createSingleHunkDiff(originalContent: string, newContent: string, filepath: string): string {
+  const oldLines = splitDiffLines(originalContent);
+  const newLines = splitDiffLines(newContent);
+
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+
+  const hunks: StructuredPatchHunk[] = [];
+  const oldEnd = oldLines.length - suffix;
+  const newEnd = newLines.length - suffix;
+  if (prefix < oldEnd || prefix < newEnd) {
+    const start = Math.max(0, prefix - DIFF_CONTEXT_LINES);
+    const trailing = Math.min(suffix, DIFF_CONTEXT_LINES);
+    const rawLines = [
+      ...oldLines.slice(start, prefix).map((line) => ' ' + line),
+      ...oldLines.slice(prefix, oldEnd).map((line) => '-' + line),
+      ...newLines.slice(prefix, newEnd).map((line) => '+' + line),
+      ...oldLines.slice(oldEnd, oldEnd + trailing).map((line) => ' ' + line),
+    ];
+    const lines: string[] = [];
+    for (const line of rawLines) {
+      if (line.endsWith('\n')) {
+        lines.push(line.slice(0, -1));
+      } else {
+        lines.push(line, '\\ No newline at end of file');
+      }
+    }
+    hunks.push({
+      oldStart: start + 1,
+      oldLines: oldEnd + trailing - start,
+      newStart: start + 1,
+      newLines: newEnd + trailing - start,
+      lines,
+    });
+  }
+
+  return formatPatch({
+    oldFileName: filepath,
+    newFileName: filepath,
+    oldHeader: 'original',
+    newHeader: 'modified',
+    hunks,
+  });
 }
 
 // Helper function to resolve relative paths against allowed directories
@@ -262,6 +337,46 @@ interface FileEdit {
   newText: string;
 }
 
+const MAX_EDIT_SCAN_CHARS = 256 * 1024 * 1024;
+
+/**
+ * Returns the index of the first window of `contentLines` whose trimmed lines
+ * equal the trimmed `targetLines`, or -1. Runs in time linear in the total
+ * length of both inputs: testing every window instead is quadratic and lets a
+ * large non-matching edit stall the server.
+ */
+function findTrimmedLineSequence(contentLines: string[], targetLines: string[]): number {
+  // Trimmed lines contain no '\n', so a needle that starts and ends with '\n'
+  // can only match a run of whole lines.
+  const haystack = `\n${contentLines.map((line) => line.trim()).join('\n')}\n`;
+  const needle = `\n${targetLines.map((line) => line.trim()).join('\n')}\n`;
+
+  // Knuth-Morris-Pratt, for a worst-case linear bound independent of the engine.
+  const failure = new Int32Array(needle.length);
+  for (let i = 1, k = 0; i < needle.length; i++) {
+    while (k > 0 && needle.charCodeAt(i) !== needle.charCodeAt(k)) k = failure[k - 1];
+    if (needle.charCodeAt(i) === needle.charCodeAt(k)) k++;
+    failure[i] = k;
+  }
+
+  let matchStart = -1;
+  for (let i = 0, k = 0; i < haystack.length; i++) {
+    while (k > 0 && haystack.charCodeAt(i) !== needle.charCodeAt(k)) k = failure[k - 1];
+    if (haystack.charCodeAt(i) === needle.charCodeAt(k)) k++;
+    if (k === needle.length) {
+      matchStart = i - needle.length + 1;
+      break;
+    }
+  }
+  if (matchStart === -1) return -1;
+
+  let lineIndex = 0;
+  for (let i = 0; i < matchStart; i++) {
+    if (haystack.charCodeAt(i) === 10) lineIndex++;
+  }
+  return lineIndex;
+}
+
 export async function applyFileEdits(
   filePath: string,
   edits: FileEdit[],
@@ -272,7 +387,18 @@ export async function applyFileEdits(
 
   // Apply edits sequentially
   let modifiedContent = content;
+  let scannedChars = 0;
   for (const edit of edits) {
+    // Each edit scans the whole file, so cap the total to keep many edits
+    // against a large file from stalling the server.
+    scannedChars += modifiedContent.length + edit.oldText.length + edit.newText.length;
+    if (scannedChars > MAX_EDIT_SCAN_CHARS) {
+      throw new Error(
+        `Edits are too large to apply in one call (more than ${MAX_EDIT_SCAN_CHARS} characters ` +
+        `of file and edit text to process). Use fewer edits or split the change across calls.`
+      );
+    }
+
     const normalizedOld = normalizeLineEndings(edit.oldText);
     const normalizedNew = normalizeLineEndings(edit.newText);
 
@@ -285,42 +411,31 @@ export async function applyFileEdits(
     // Otherwise, try line-by-line matching with flexibility for whitespace
     const oldLines = normalizedOld.split('\n');
     const contentLines = modifiedContent.split('\n');
-    let matchFound = false;
 
-    for (let i = 0; i <= contentLines.length - oldLines.length; i++) {
-      const potentialMatch = contentLines.slice(i, i + oldLines.length);
-
-      // Compare lines with normalized whitespace
-      const isMatch = oldLines.every((oldLine, j) => {
-        const contentLine = potentialMatch[j];
-        return oldLine.trim() === contentLine.trim();
-      });
-
-      if (isMatch) {
-        // Preserve original indentation of first line
-        const originalIndent = contentLines[i].match(/^\s*/)?.[0] || '';
-        const newLines = normalizedNew.split('\n').map((line, j) => {
-          if (j === 0) return originalIndent + line.trimStart();
-          // For subsequent lines, try to preserve relative indentation
-          const oldIndent = oldLines[j]?.match(/^\s*/)?.[0] || '';
-          const newIndent = line.match(/^\s*/)?.[0] || '';
-          if (oldIndent && newIndent) {
-            const relativeIndent = newIndent.length - oldIndent.length;
-            return originalIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
-          }
-          return line;
-        });
-
-        contentLines.splice(i, oldLines.length, ...newLines);
-        modifiedContent = contentLines.join('\n');
-        matchFound = true;
-        break;
-      }
-    }
-
-    if (!matchFound) {
+    const i = findTrimmedLineSequence(contentLines, oldLines);
+    if (i === -1) {
       throw new Error(`Could not find exact match for edit:\n${edit.oldText}`);
     }
+
+    // Preserve original indentation of first line
+    const originalIndent = contentLines[i].match(/^\s*/)?.[0] || '';
+    const newLines = normalizedNew.split('\n').map((line, j) => {
+      if (j === 0) return originalIndent + line.trimStart();
+      // For subsequent lines, try to preserve relative indentation
+      const oldIndent = oldLines[j]?.match(/^\s*/)?.[0] || '';
+      const newIndent = line.match(/^\s*/)?.[0] || '';
+      if (oldIndent && newIndent) {
+        const relativeIndent = newIndent.length - oldIndent.length;
+        return originalIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
+      }
+      return line;
+    });
+
+    modifiedContent = [
+      ...contentLines.slice(0, i),
+      ...newLines,
+      ...contentLines.slice(i + oldLines.length),
+    ].join('\n');
   }
 
   // Create unified diff
