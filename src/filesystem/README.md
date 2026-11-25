@@ -147,6 +147,8 @@ The server's directory access control follows this flow:
     - `excludePatterns` (string[]): Exclude any patterns.
   - Glob-style pattern matching
   - Returns full paths to matches
+  - Fails if the search visits more than 5000 entries or descends more than 20 directories below `path`
+  - Skips `node_modules`, `.git`, and `dist` directories below `path`; pass one as `path` to search it
 
 - **directory_tree**
   - Get recursive JSON tree structure of directory contents
@@ -161,6 +163,8 @@ The server's directory access control follows this flow:
         - Empty array for empty directories
         - Omitted for files
   - Output is formatted with 2-space indentation for readability
+  - Fails if the tree has more than 5000 entries or is nested more than 20 directories below `path`
+  - Skips `node_modules`, `.git`, and `dist` directories below `path`; pass one as `path` to list it
     
 - **get_file_info**
   - Get detailed file/directory metadata
