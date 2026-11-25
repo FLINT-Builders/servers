@@ -95,6 +95,7 @@ The server's directory access control follows this flow:
   - Inputs:
     - `path` (string): File location
     - `content` (string): File content
+  - `content` must be at most 1 MiB (1,048,576 bytes) when UTF-8 encoded; larger content is rejected before anything is written
 
 - **edit_file**
   - Make selective edits using advanced pattern matching and formatting
@@ -112,6 +113,7 @@ The server's directory access control follows this flow:
       - `newText` (string): Text to replace with
     - `dryRun` (boolean): Preview changes without applying (default: false)
   - Returns detailed diff and match information for dry runs, otherwise applies changes
+  - Each `newText`, and the file content after all edits, must be at most 1 MiB (1,048,576 bytes) when UTF-8 encoded; edits that exceed this are rejected before anything is written. An edit may shrink a file that is already larger than the limit, as long as the result fits
   - Best Practice: Always use dryRun first to preview changes before applying them
 
 - **create_directory**

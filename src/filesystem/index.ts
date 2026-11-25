@@ -362,7 +362,8 @@ server.registerTool(
     description:
       "Create a new file or completely overwrite an existing file with new content. " +
       "Use with caution as it will overwrite existing files without warning. " +
-      "Handles text content with proper encoding. Only works within allowed directories.",
+      "Handles text content with proper encoding. Content is limited to 1 MiB (1048576 bytes) " +
+      "when UTF-8 encoded. Only works within allowed directories.",
     inputSchema: {
       path: z.string(),
       content: z.string()
@@ -388,6 +389,7 @@ server.registerTool(
     description:
       "Make line-based edits to a text file. Each edit replaces exact line sequences " +
       "with new content. Returns a git-style diff showing the changes made. " +
+      "Each newText and the edited file are limited to 1 MiB (1048576 bytes) when UTF-8 encoded. " +
       "Only works within allowed directories.",
     inputSchema: {
       path: z.string(),
