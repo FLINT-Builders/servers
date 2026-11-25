@@ -54,6 +54,16 @@ Example:
 
 ## API
 
+### Storage limits
+
+The whole graph is rewritten on every change and read back on every call, so writes are bounded:
+
+- Entity names, entity types, and relation types: at most 1024 characters
+- Observations: at most 8192 characters each, and at most 128 per entity
+- The memory file: at most 1 MiB (UTF-8 bytes) after the write
+
+`create_entities`, `create_relations`, and `add_observations` reject the whole call, without touching the memory file, if it would break any of these limits. The delete tools are always allowed, so a graph that grew past the limit before it existed can still be pruned.
+
 ### Tools
 - **create_entities**
   - Create multiple new entities in the knowledge graph

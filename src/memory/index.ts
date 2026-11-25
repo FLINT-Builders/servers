@@ -82,6 +82,67 @@ export interface KnowledgeGraph {
   relations: Relation[];
 }
 
+// The whole graph is rewritten on every mutation and read back in full on
+// every call, so anything stored here is paid for again on each later request.
+// Field lengths are JavaScript string lengths; the graph bound is the UTF-8
+// byte length of the exact file body saveGraph writes.
+export const MAX_ENTITY_NAME_LENGTH = 1024;
+export const MAX_ENTITY_TYPE_LENGTH = 1024;
+export const MAX_OBSERVATION_LENGTH = 8192;
+export const MAX_OBSERVATIONS_PER_ENTITY = 128;
+export const MAX_RELATION_TYPE_LENGTH = 1024;
+export const MAX_GRAPH_FILE_BYTES = 1024 * 1024;
+
+function assertMaxLength(value: string, max: number, label: string): void {
+  if (value.length > max) {
+    throw new Error(`${label} exceeds the ${max}-character limit (got ${value.length})`);
+  }
+}
+
+function assertObservationCount(count: number): void {
+  if (count > MAX_OBSERVATIONS_PER_ENTITY) {
+    throw new Error(
+      `An entity would exceed the limit of ${MAX_OBSERVATIONS_PER_ENTITY} observations (got ${count})`
+    );
+  }
+}
+
+// The validate* helpers return copies so that what gets stored is exactly
+// what was checked, even if the caller mutates its arguments while the
+// operation waits for the mutation lock.
+function validateObservations(observations: string[]): string[] {
+  const copy = [...observations];
+  for (const observation of copy) {
+    assertMaxLength(observation, MAX_OBSERVATION_LENGTH, "Observation");
+  }
+  return copy;
+}
+
+function validateEntity(entity: Entity): Entity {
+  const copy: Entity = {
+    name: entity.name,
+    entityType: entity.entityType,
+    observations: [...entity.observations],
+  };
+  assertMaxLength(copy.name, MAX_ENTITY_NAME_LENGTH, "Entity name");
+  assertMaxLength(copy.entityType, MAX_ENTITY_TYPE_LENGTH, "Entity type");
+  assertObservationCount(copy.observations.length);
+  validateObservations(copy.observations);
+  return copy;
+}
+
+function validateRelation(relation: Relation): Relation {
+  const copy: Relation = {
+    from: relation.from,
+    to: relation.to,
+    relationType: relation.relationType,
+  };
+  assertMaxLength(copy.from, MAX_ENTITY_NAME_LENGTH, "Relation source entity name");
+  assertMaxLength(copy.to, MAX_ENTITY_NAME_LENGTH, "Relation target entity name");
+  assertMaxLength(copy.relationType, MAX_RELATION_TYPE_LENGTH, "Relation type");
+  return copy;
+}
+
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
   constructor(private memoryFilePath: string) {}
@@ -159,7 +220,10 @@ export class KnowledgeGraphManager {
     }
   }
 
-  private async saveGraph(graph: KnowledgeGraph): Promise<void> {
+  // Mutations that can grow the graph must keep the file within
+  // MAX_GRAPH_FILE_BYTES. Deletions only shrink it, so they skip the check:
+  // a graph written before the limit existed can still be pruned below it.
+  private async saveGraph(graph: KnowledgeGraph, { enforceSizeLimit = true } = {}): Promise<void> {
     const lines = [
       ...graph.entities.map(e => JSON.stringify({
         type: "entity",
@@ -174,6 +238,17 @@ export class KnowledgeGraphManager {
         relationType: r.relationType
       })),
     ];
+    const body = lines.join("\n") + "\n";
+
+    if (enforceSizeLimit) {
+      const size = Buffer.byteLength(body, "utf8");
+      if (size > MAX_GRAPH_FILE_BYTES) {
+        throw new Error(
+          `Knowledge graph would exceed the ${MAX_GRAPH_FILE_BYTES}-byte storage limit (${size} bytes); ` +
+          `delete unused entities, relations, or observations first`
+        );
+      }
+    }
 
     // Write to a temporary file in the same directory, then rename it over
     // the target. fs.writeFile would truncate the memory file before writing,
@@ -190,7 +265,7 @@ export class KnowledgeGraphManager {
     );
 
     try {
-      await fs.writeFile(tempFilePath, lines.join("\n") + "\n");
+      await fs.writeFile(tempFilePath, body);
       await fs.rename(tempFilePath, this.memoryFilePath);
     } catch (error) {
       // Never leave a stray temp file behind on failure.
@@ -199,7 +274,8 @@ export class KnowledgeGraphManager {
     }
   }
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
+  async createEntities(requested: Entity[]): Promise<Entity[]> {
+    const entities = requested.map(validateEntity);
     return this.withLock(async () => {
       const graph = await this.loadGraph();
       const newEntities = entities.filter((e, index) =>
@@ -213,7 +289,8 @@ export class KnowledgeGraphManager {
     });
   }
 
-  async createRelations(relations: Relation[]): Promise<Relation[]> {
+  async createRelations(requested: Relation[]): Promise<Relation[]> {
+    const relations = requested.map(validateRelation);
     return this.withLock(async () => {
       const graph = await this.loadGraph();
       const entityNames = new Set(graph.entities.map(e => e.name));
@@ -242,18 +319,27 @@ export class KnowledgeGraphManager {
     });
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  async addObservations(requested: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+    const observations = requested.map(o => ({
+      entityName: o.entityName,
+      contents: validateObservations(o.contents),
+    }));
     return this.withLock(async () => {
       const graph = await this.loadGraph();
+      const grown = new Set<Entity>();
       const results = observations.map(o => {
         const entity = graph.entities.find(e => e.name === o.entityName);
         if (!entity) {
           throw new Error(`Entity with name ${o.entityName} not found`);
         }
         const newObservations = o.contents.filter(content => !entity.observations.includes(content));
-        entity.observations.push(...newObservations);
+        if (newObservations.length > 0) {
+          entity.observations.push(...newObservations);
+          grown.add(entity);
+        }
         return { entityName: o.entityName, addedObservations: newObservations };
       });
+      grown.forEach(entity => assertObservationCount(entity.observations.length));
       await this.saveGraph(graph);
       return results;
     });
@@ -267,7 +353,7 @@ export class KnowledgeGraphManager {
       const notFound = entityNames.filter(name => !present.has(name));
       graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
       graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
-      await this.saveGraph(graph);
+      await this.saveGraph(graph, { enforceSizeLimit: false });
       return { deleted, notFound };
     });
   }
@@ -287,7 +373,7 @@ export class KnowledgeGraphManager {
           missingEntities.push(d.entityName);
         }
       });
-      await this.saveGraph(graph);
+      await this.saveGraph(graph, { enforceSizeLimit: false });
       return { deletedCount, missingEntities };
     });
   }
@@ -301,7 +387,7 @@ export class KnowledgeGraphManager {
         r.to === delRelation.to && 
         r.relationType === delRelation.relationType
       ));
-      await this.saveGraph(graph);
+      await this.saveGraph(graph, { enforceSizeLimit: false });
       return { deletedCount: before - graph.relations.length };
     });
   }
@@ -379,6 +465,25 @@ const RelationSchema = z.object({
   relationType: z.string().describe("The type of the relation")
 });
 
+// Bounded variants for tool input. EntitySchema and RelationSchema stay
+// unbounded because they also parse the memory file and describe tool output,
+// where data written before these limits existed must still be accepted.
+const ObservationInputSchema = z.string().max(MAX_OBSERVATION_LENGTH);
+
+const EntityInputSchema = z.object({
+  name: z.string().max(MAX_ENTITY_NAME_LENGTH).describe("The name of the entity"),
+  entityType: z.string().max(MAX_ENTITY_TYPE_LENGTH).describe("The type of the entity"),
+  observations: z.array(ObservationInputSchema)
+    .max(MAX_OBSERVATIONS_PER_ENTITY)
+    .describe("An array of observation contents associated with the entity")
+});
+
+const RelationInputSchema = z.object({
+  from: z.string().max(MAX_ENTITY_NAME_LENGTH).describe("The name of the entity where the relation starts"),
+  to: z.string().max(MAX_ENTITY_NAME_LENGTH).describe("The name of the entity where the relation ends"),
+  relationType: z.string().max(MAX_RELATION_TYPE_LENGTH).describe("The type of the relation")
+});
+
 const server = new McpServer({
   name: "memory-server",
   version: SERVER_VERSION,
@@ -405,7 +510,7 @@ server.registerTool(
     title: "Create Entities",
     description: "Create multiple new entities in the knowledge graph",
     inputSchema: {
-      entities: z.array(EntitySchema)
+      entities: z.array(EntityInputSchema)
     },
     outputSchema: {
       entities: z.array(EntitySchema)
@@ -434,7 +539,7 @@ server.registerTool(
     title: "Create Relations",
     description: "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice",
     inputSchema: {
-      relations: z.array(RelationSchema)
+      relations: z.array(RelationInputSchema)
     },
     outputSchema: {
       relations: z.array(RelationSchema)
@@ -465,7 +570,7 @@ server.registerTool(
     inputSchema: {
       observations: z.array(z.object({
         entityName: z.string().describe("The name of the entity to add the observations to"),
-        contents: z.array(z.string()).describe("An array of observation contents to add")
+        contents: z.array(ObservationInputSchema).describe("An array of observation contents to add")
       }))
     },
     outputSchema: {
