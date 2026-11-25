@@ -1,4 +1,7 @@
+import codecs
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from mcp.server import Server
@@ -19,6 +22,86 @@ from pydantic import BaseModel, Field
 
 # Default number of context lines to show in diff output
 DEFAULT_CONTEXT_LINES = 3
+
+# Upper bound, in UTF-8 bytes, on the git output a single tool call returns.
+# Output beyond it is never read into memory; the git process is stopped and
+# the result ends with TRUNCATION_NOTICE instead.
+MAX_OUTPUT_BYTES = 48 * 1024
+TRUNCATION_NOTICE = (
+    "\n[output truncated: exceeded the {limit} byte limit; "
+    "narrow the request (e.g. a smaller revision range or fewer files)]"
+)
+_STDERR_LIMIT = 4096
+
+
+def _truncate_utf8(text: str, limit: int) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+
+def _with_notice(text: str, truncated: bool) -> str:
+    if not truncated:
+        return text
+    return text + TRUNCATION_NOTICE.format(limit=MAX_OUTPUT_BYTES)
+
+
+def _run_git_bounded(repo: git.Repo, args: list[str], limit: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
+    """Run git and return at most `limit` UTF-8 bytes of its stdout.
+
+    Reads no more than `limit + 1` bytes; if git has more to write, it is
+    killed rather than drained. Returns the decoded text and whether it was
+    truncated.
+    """
+    limit = max(limit, 0)
+    command = [git.Git.GIT_PYTHON_GIT_EXECUTABLE or "git", *args]
+    with tempfile.TemporaryFile() as stderr:
+        proc = subprocess.Popen(
+            command,
+            cwd=repo.working_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+        )
+        assert proc.stdout is not None
+        try:
+            data = proc.stdout.read(limit + 1)
+            overflow = len(data) > limit
+            if overflow:
+                proc.kill()
+        finally:
+            proc.stdout.close()
+            status = proc.wait()
+        if not overflow and status != 0:
+            stderr.seek(0)
+            message = stderr.read(_STDERR_LIMIT).decode("utf-8", errors="replace")
+            raise git.GitCommandError(command, status, message)
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text, truncated = _truncate_utf8(decoder.decode(data[:limit], final=not overflow), limit)
+    truncated = truncated or overflow
+    if not truncated and text.endswith("\n"):
+        text = text[:-1]
+    return text, truncated
+
+
+def _resolve_revision(repo: git.Repo, revision: str, peel: str = "object") -> str:
+    """Resolve `revision` to an object id with git rev-parse.
+
+    GitPython's rev_parse parses every commit it walks for `~`/`^` navigation,
+    reading each object (and its message) fully into this process.
+    """
+    try:
+        sha, truncated = _run_git_bounded(
+            repo, ["rev-parse", "--verify", "--quiet", f"{revision}^{{{peel}}}"], 128
+        )
+    except git.GitCommandError:
+        raise BadName(revision)
+    if truncated or not sha:
+        raise BadName(revision)
+    return sha
+
 
 class GitStatus(BaseModel):
     repo_path: str
@@ -109,21 +192,21 @@ class GitTools(str, Enum):
     BRANCH = "git_branch"
 
 def git_status(repo: git.Repo) -> str:
-    return repo.git.status()
+    return _with_notice(*_run_git_bounded(repo, ["status"]))
 
 def git_diff_unstaged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
-    return repo.git.diff(f"--unified={context_lines}")
+    return _with_notice(*_run_git_bounded(repo, ["diff", f"--unified={context_lines}"]))
 
 def git_diff_staged(repo: git.Repo, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
-    return repo.git.diff(f"--unified={context_lines}", "--cached")
+    return _with_notice(*_run_git_bounded(repo, ["diff", f"--unified={context_lines}", "--cached"]))
 
 def git_diff(repo: git.Repo, target: str, context_lines: int = DEFAULT_CONTEXT_LINES) -> str:
     # Defense in depth: reject targets starting with '-' to prevent flag injection,
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
     if target.startswith("-"):
         raise BadName(f"Invalid target: '{target}' - cannot start with '-'")
-    repo.rev_parse(target)  # Validates target is a real git ref, throws BadName if not
-    return repo.git.diff(f"--unified={context_lines}", target)
+    sha = _resolve_revision(repo, target)  # Validates target is a real git ref, throws BadName if not
+    return _with_notice(*_run_git_bounded(repo, ["diff", f"--unified={context_lines}", sha]))
 
 def git_commit(repo: git.Repo, message: str) -> str:
     commit = repo.index.commit(message)
@@ -169,15 +252,26 @@ def git_log(repo: git.Repo, max_count: int = 10, start_timestamp: Optional[str] 
     if end_timestamp:
         kwargs["until"] = end_timestamp
 
-    commits = list(repo.iter_commits(**kwargs))
-    log = []
-    for commit in commits:
-        log.append(
+    log: list[str] = []
+    remaining = MAX_OUTPUT_BYTES
+    for commit in repo.iter_commits(**kwargs):
+        # commit.size reads only the object header, so an oversized commit is
+        # never parsed into memory.
+        if commit.size > remaining:
+            log.append(TRUNCATION_NOTICE.format(limit=MAX_OUTPUT_BYTES).lstrip("\n"))
+            break
+        entry, truncated = _truncate_utf8(
             f"Commit: {commit.hexsha}\n"
             f"Author: {commit.author}\n"
             f"Date: {commit.authored_datetime}\n"
-            f"Message: {commit.message}\n"
+            f"Message: {commit.message}\n",
+            remaining,
         )
+        log.append(entry)
+        remaining -= len(entry.encode("utf-8")) + 1
+        if truncated or remaining <= 0:
+            log.append(TRUNCATION_NOTICE.format(limit=MAX_OUTPUT_BYTES).lstrip("\n"))
+            break
     return log
 
 def git_create_branch(repo: git.Repo, branch_name: str, base_branch: str | None = None) -> str:
@@ -199,7 +293,7 @@ def git_checkout(repo: git.Repo, branch_name: str) -> str:
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
     if branch_name.startswith("-"):
         raise BadName(f"Invalid branch name: '{branch_name}' - cannot start with '-'")
-    repo.rev_parse(branch_name)  # Validates branch_name is a real git ref, throws BadName if not
+    _resolve_revision(repo, branch_name)  # Validates branch_name is a real git ref, throws BadName if not
     repo.git.checkout(branch_name)
     return f"Switched to branch '{branch_name}'"
 
@@ -210,27 +304,33 @@ def git_show(repo: git.Repo, revision: str) -> str:
     # even if a malicious ref with that name exists (e.g. via filesystem manipulation)
     if revision.startswith("-"):
         raise BadName(f"Invalid revision: '{revision}' - cannot start with '-'")
-    commit = repo.commit(revision)
-    output = [
+    commit = repo.commit(_resolve_revision(repo, revision, "commit"))
+    # commit.size reads only the object header, so an oversized commit object
+    # is never parsed into memory.
+    if commit.size > MAX_OUTPUT_BYTES:
+        return _with_notice(f"Commit: {commit.hexsha!r}\n", True)
+    header, truncated = _truncate_utf8(
         f"Commit: {commit.hexsha!r}\n"
         f"Author: {commit.author!r}\n"
         f"Date: {commit.authored_datetime!r}\n"
-        f"Message: {commit.message!r}\n"
-    ]
+        f"Message: {commit.message!r}\n",
+        MAX_OUTPUT_BYTES,
+    )
+    if truncated:
+        return _with_notice(header, True)
+
     if commit.parents:
-        parent = commit.parents[0]
-        diff = parent.diff(commit, create_patch=True)
+        diff_args = [commit.parents[0].hexsha, commit.hexsha]
     else:
-        diff = commit.diff(git.NULL_TREE, create_patch=True)
-    for d in diff:
-        output.append(f"\n--- {d.a_path}\n+++ {d.b_path}\n")
-        if d.diff is None:
-            continue
-        if isinstance(d.diff, bytes):
-            output.append(d.diff.decode('utf-8'))
-        else:
-            output.append(d.diff)
-    return "".join(output)
+        diff_args = ["--root", commit.hexsha]
+    patch, truncated = _run_git_bounded(
+        repo,
+        ["diff-tree", "-r", "-p", "--no-commit-id", *diff_args],
+        MAX_OUTPUT_BYTES - len(header.encode("utf-8")) - 1,
+    )
+    if patch:
+        header += "\n" + patch
+    return _with_notice(header, truncated)
 
 def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None:
     """Validate that repo_path is within the allowed repository path."""
@@ -282,10 +382,8 @@ def git_branch(repo: git.Repo, branch_type: str, contains: str | None = None, no
         case _:
             return f"Invalid branch type: {branch_type}"
 
-    # None value will be auto deleted by GitPython
-    branch_info = repo.git.branch(b_type, *contains_sha, *not_contains_sha)
-
-    return branch_info
+    args = [arg for arg in ("branch", b_type, *contains_sha, *not_contains_sha) if arg is not None]
+    return _with_notice(*_run_git_bounded(repo, args))
 
 
 async def serve(repository: Path | None) -> None:
