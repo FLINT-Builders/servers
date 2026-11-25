@@ -19,15 +19,17 @@ Published on npm as [`@modelcontextprotocol/server-sequential-thinking`](https:/
 Facilitates a detailed, step-by-step thinking process for problem-solving and analysis.
 
 **Inputs:**
-- `thought` (string): The current thinking step
+- `thought` (string, at most 100,000 characters): The current thinking step
 - `nextThoughtNeeded` (boolean): Whether another thought step is needed
 - `thoughtNumber` (integer): Current thought number
 - `totalThoughts` (integer): Estimated total thoughts needed
 - `isRevision` (boolean, optional): Whether this revises previous thinking
 - `revisesThought` (integer, optional): Which thought is being reconsidered
 - `branchFromThought` (integer, optional): Branching point thought number
-- `branchId` (string, optional): Branch identifier
+- `branchId` (string, optional, at most 256 characters): Branch identifier
 - `needsMoreThoughts` (boolean, optional): If more thoughts are needed
+
+**Limits:** the server keeps the 128 most recent thoughts; older ones are dropped, and a branch is dropped once none of its thoughts remain. At most 32 branches can be active at once; a thought that would start a 33rd is rejected. Calls with an overlong `thought` or `branchId` are rejected and nothing from them is kept.
 
 ## Usage
 
@@ -127,7 +129,7 @@ On Windows, use `cmd /c` to launch `npx`:
 }
 ```
 
-To disable logging of thought information set env var: `DISABLE_THOUGHT_LOGGING` to `true`.
+To disable logging of thought information set env var: `DISABLE_THOUGHT_LOGGING` to `true`. Thought logs are also skipped while earlier output is still waiting to be written to stderr.
 
 ### Usage with VS Code
 

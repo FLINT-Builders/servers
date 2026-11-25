@@ -3,7 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { SequentialThinkingServer } from './lib.js';
+import { MAX_BRANCH_ID_LENGTH, MAX_THOUGHT_LENGTH, SequentialThinkingServer } from './lib.js';
 import { SERVER_VERSION } from './version.js';
 
 /** Safe boolean coercion that correctly handles string "false". A union+transform,
@@ -82,14 +82,14 @@ You should:
 10. Provide a single, ideally correct answer as the final output
 11. Only set nextThoughtNeeded to false when truly done and a satisfactory answer is reached`,
     inputSchema: {
-      thought: z.string().describe("Your current thinking step"),
+      thought: z.string().max(MAX_THOUGHT_LENGTH).describe("Your current thinking step"),
       nextThoughtNeeded: coercedBoolean.describe("Whether another thought step is needed"),
       thoughtNumber: z.coerce.number().int().min(1).describe("Current thought number (numeric value, e.g., 1, 2, 3)"),
       totalThoughts: z.coerce.number().int().min(1).describe("Estimated total thoughts needed (numeric value, e.g., 5, 10)"),
       isRevision: coercedBoolean.optional().describe("Whether this revises previous thinking"),
       revisesThought: z.coerce.number().int().min(1).optional().describe("Which thought is being reconsidered"),
       branchFromThought: z.coerce.number().int().min(1).optional().describe("Branching point thought number"),
-      branchId: z.string().optional().describe("Branch identifier"),
+      branchId: z.string().max(MAX_BRANCH_ID_LENGTH).optional().describe("Branch identifier"),
       needsMoreThoughts: coercedBoolean.optional().describe("If more thoughts are needed")
     },
     annotations: {
