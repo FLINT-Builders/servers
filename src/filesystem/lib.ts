@@ -73,6 +73,20 @@ export function createUnifiedDiff(originalContent: string, newContent: string, f
   );
 }
 
+export function longestBacktickRun(text: string): number {
+  let longest = 0;
+  let current = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 96) {
+      current++;
+      if (current > longest) longest = current;
+    } else {
+      current = 0;
+    }
+  }
+  return longest;
+}
+
 // Helper function to resolve relative paths against allowed directories
 function resolveRelativePathAgainstAllowedDirectories(relativePath: string): string {
   if (allowedDirectories.length === 0) {
@@ -326,11 +340,8 @@ export async function applyFileEdits(
   // Create unified diff
   const diff = createUnifiedDiff(content, modifiedContent, filePath);
 
-  // Format diff with appropriate number of backticks
-  let numBackticks = 3;
-  while (diff.includes('`'.repeat(numBackticks))) {
-    numBackticks++;
-  }
+  // Format diff with a fence longer than any backtick run it contains
+  const numBackticks = Math.max(3, longestBacktickRun(diff) + 1);
   const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
 
   if (!dryRun) {
