@@ -360,9 +360,18 @@ export async function applyFileEdits(
   return formattedDiff;
 }
 
-// Memory-efficient implementation to get the last N lines of a file
+export const MAX_TAIL_LINES = 10_000;
+export const MAX_TAIL_BYTES = 1024 * 1024;
+
+// Memory-efficient implementation to get the last N lines of a file.
+// Returns at most MAX_TAIL_LINES lines and never reads more than
+// MAX_TAIL_BYTES from the end of the file, so a line longer than that
+// is truncated at its start.
 export async function tailFile(filePath: string, numLines: number): Promise<string> {
   const CHUNK_SIZE = 1024; // Read 1KB at a time
+  const lineLimit = Math.min(Math.floor(numLines), MAX_TAIL_LINES);
+  if (!(lineLimit > 0)) return '';
+
   const stats = await fs.stat(filePath);
   const fileSize = stats.size;
   
@@ -371,28 +380,40 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
   // Open file for reading
   const fileHandle = await fs.open(filePath, 'r');
   try {
+    // Chunks are collected newest-first and reversed once at the end;
+    // prepending each chunk would make the scan quadratic.
     const chunks: Buffer[] = [];
+    const scanStart = Math.max(0, fileSize - MAX_TAIL_BYTES);
     let position = fileSize;
-    const chunk = Buffer.alloc(CHUNK_SIZE);
     let newlinesFound = 0;
     
     // Read chunks from the end of the file until we have enough lines
-    while (position > 0 && newlinesFound < numLines) {
-      const size = Math.min(CHUNK_SIZE, position);
+    while (position > scanStart && newlinesFound < lineLimit) {
+      const size = Math.min(CHUNK_SIZE, position - scanStart);
       position -= size;
       
+      const chunk = Buffer.alloc(size);
       const { bytesRead } = await fileHandle.read(chunk, 0, size, position);
       if (!bytesRead) break;
 
-      const readData = Buffer.from(chunk.subarray(0, bytesRead));
-      chunks.unshift(readData);
+      const readData = chunk.subarray(0, bytesRead);
+      chunks.push(readData);
       for (const byte of readData) {
         if (byte === 0x0a) newlinesFound++;
       }
     }
 
-    const text = normalizeLineEndings(Buffer.concat(chunks).toString('utf-8'));
-    return text.split('\n').slice(-numLines).join('\n');
+    chunks.reverse();
+    let data = Buffer.concat(chunks);
+    if (position > 0) {
+      // The scan may have stopped inside a multi-byte UTF-8 sequence.
+      let start = 0;
+      while (start < data.length && start < 3 && (data[start] & 0xc0) === 0x80) start++;
+      data = data.subarray(start);
+    }
+
+    const text = normalizeLineEndings(data.toString('utf-8'));
+    return text.split('\n').slice(-lineLimit).join('\n');
   } finally {
     await fileHandle.close();
   }
@@ -403,7 +424,9 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
   const fileHandle = await fs.open(filePath, 'r');
   try {
     const lines: string[] = [];
-    let buffer = '';
+    // Pieces of the current, not yet terminated line. Only newly decoded
+    // text is searched for newlines, so a long line is scanned once.
+    let partialLine: string[] = [];
     let bytesRead = 0;
     const chunk = Buffer.alloc(1024); // 1KB buffer
     const decoder = new StringDecoder('utf-8');
@@ -413,20 +436,22 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
       const result = await fileHandle.read(chunk, 0, chunk.length, bytesRead);
       if (result.bytesRead === 0) break; // End of file
       bytesRead += result.bytesRead;
-      buffer += decoder.write(chunk.subarray(0, result.bytesRead));
+      const text = decoder.write(chunk.subarray(0, result.bytesRead));
       
-      const newLineIndex = buffer.lastIndexOf('\n');
-      if (newLineIndex !== -1) {
-        const completeLines = buffer.slice(0, newLineIndex).split('\n');
-        buffer = buffer.slice(newLineIndex + 1);
-        for (const line of completeLines) {
-          lines.push(line);
-          if (lines.length >= numLines) break;
-        }
+      let start = 0;
+      let newLineIndex = text.indexOf('\n', start);
+      while (newLineIndex !== -1 && lines.length < numLines) {
+        partialLine.push(text.slice(start, newLineIndex));
+        lines.push(partialLine.join(''));
+        partialLine = [];
+        start = newLineIndex + 1;
+        newLineIndex = text.indexOf('\n', start);
       }
+      partialLine.push(text.slice(start));
     }
 
-    buffer += decoder.end();
+    partialLine.push(decoder.end());
+    const buffer = partialLine.join('');
     
     // If there is leftover content and we still need lines, add it
     if (buffer.length > 0 && lines.length < numLines) {

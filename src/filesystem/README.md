@@ -73,7 +73,7 @@ The server's directory access control follows this flow:
   - Inputs:
     - `path` (string)
     - `head` (number, optional): First N lines
-    - `tail` (number, optional): Last N lines
+    - `tail` (number, optional): Last N lines, capped at 10,000 lines read from at most the last 1 MiB of the file
   - Always treats the file as UTF-8 text regardless of extension
   - Cannot specify both `head` and `tail` simultaneously
 
