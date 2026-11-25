@@ -12,6 +12,34 @@ export interface ThoughtData {
   nextThoughtNeeded: boolean;
 }
 
+// C0, DEL, and C1 controls (ESC, BEL, CR, 8-bit CSI, ...) plus Unicode line
+// separators and bidi overrides, all of which a terminal may act on or use to
+// visually reorder or hide surrounding output.
+const TERMINAL_UNSAFE_CHARS = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069]/gu;
+
+const NAMED_ESCAPES: Record<string, string> = {
+  '\n': '\\n',
+  '\r': '\\r',
+  '\t': '\\t',
+};
+
+/**
+ * Makes untrusted text safe to write to a terminal by replacing every control
+ * character with a visible escape sequence such as `\x1b`.
+ */
+export function escapeForTerminal(text: string): string {
+  return text.replace(TERMINAL_UNSAFE_CHARS, (ch) => {
+    const named = NAMED_ESCAPES[ch];
+    if (named) {
+      return named;
+    }
+    const cp = ch.codePointAt(0)!;
+    return cp <= 0xff
+      ? `\\x${cp.toString(16).padStart(2, '0')}`
+      : `\\u${cp.toString(16).padStart(4, '0')}`;
+  });
+}
+
 export class SequentialThinkingServer {
   private thoughtHistory: ThoughtData[] = [];
   private branches: Record<string, ThoughtData[]> = {};
@@ -22,23 +50,25 @@ export class SequentialThinkingServer {
   }
 
   private formatThought(thoughtData: ThoughtData): string {
-    const { thoughtNumber, totalThoughts, thought, isRevision, revisesThought, branchFromThought, branchId } = thoughtData;
+    const { thoughtNumber, totalThoughts, isRevision, revisesThought, branchFromThought, branchId } = thoughtData;
+    const thought = escapeForTerminal(thoughtData.thought);
+    const safe = (value: unknown) => escapeForTerminal(String(value));
 
     let prefix = '';
     let context = '';
 
     if (isRevision) {
       prefix = chalk.yellow('🔄 Revision');
-      context = ` (revising thought ${revisesThought})`;
+      context = ` (revising thought ${safe(revisesThought)})`;
     } else if (branchFromThought) {
       prefix = chalk.green('🌿 Branch');
-      context = ` (from thought ${branchFromThought}, ID: ${branchId})`;
+      context = ` (from thought ${safe(branchFromThought)}, ID: ${safe(branchId)})`;
     } else {
       prefix = chalk.blue('💭 Thought');
       context = '';
     }
 
-    const header = `${prefix} ${thoughtNumber}/${totalThoughts}${context}`;
+    const header = `${prefix} ${safe(thoughtNumber)}/${safe(totalThoughts)}${context}`;
     const border = '─'.repeat(Math.max(header.length, thought.length) + 4);
 
     return `
