@@ -7,6 +7,18 @@ import { createServer } from "../server/index.js";
 import { randomUUID } from "node:crypto";
 import cors from "cors";
 
+// Serialized bytes and number of events kept for replay, all sessions combined.
+// When either is exceeded the oldest events are evicted and can no longer be replayed.
+const MAX_EVENT_STORE_BYTES = 16 * 1024 * 1024;
+const MAX_EVENT_STORE_EVENTS = 10_000;
+
+// Every retained event across all sessions, oldest first, keyed by event ID
+const retainedEvents: Map<
+  string,
+  { store: InMemoryEventStore; bytes: number }
+> = new Map();
+let retainedEventBytes = 0;
+
 // Simple in-memory event store for SSE resumability
 class InMemoryEventStore implements EventStore {
   private events: Map<string, { streamId: string; message: unknown }> =
@@ -14,8 +26,36 @@ class InMemoryEventStore implements EventStore {
 
   async storeEvent(streamId: string, message: unknown): Promise<string> {
     const eventId = randomUUID();
+    const bytes = Buffer.byteLength(JSON.stringify(message) ?? "", "utf8");
     this.events.set(eventId, { streamId, message });
+    retainedEvents.set(eventId, { store: this, bytes });
+    retainedEventBytes += bytes;
+    while (
+      retainedEventBytes > MAX_EVENT_STORE_BYTES ||
+      retainedEvents.size > MAX_EVENT_STORE_EVENTS
+    ) {
+      const oldest = retainedEvents.entries().next().value;
+      if (!oldest) break;
+      const [oldestId, { store }] = oldest;
+      store.evict(oldestId);
+    }
     return eventId;
+  }
+
+  // Drop every event held for this session
+  clear(): void {
+    for (const eventId of [...this.events.keys()]) {
+      this.evict(eventId);
+    }
+  }
+
+  private evict(eventId: string): void {
+    this.events.delete(eventId);
+    const retained = retainedEvents.get(eventId);
+    if (retained) {
+      retainedEvents.delete(eventId);
+      retainedEventBytes -= retained.bytes;
+    }
   }
 
   async replayEventsAfter(
@@ -94,6 +134,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
           transports.delete(sid);
           cleanup(sid);
         }
+        eventStore.clear();
       };
 
       // Connect the transport to the MCP server BEFORE handling the request

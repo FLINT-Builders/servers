@@ -9,6 +9,7 @@ import {
 } from "../resources/subscriptions.js";
 import { registerConditionalTools, registerTools } from "../tools/index.js";
 import { registerResources, readInstructions } from "../resources/index.js";
+import { releaseSessionResources } from "../resources/session.js";
 import { registerPrompts } from "../prompts/index.js";
 import { stopSimulatedLogging } from "./logging.js";
 import { syncRoots } from "./roots.js";
@@ -110,6 +111,8 @@ export const createServer: () => ServerFactoryResponse = () => {
       // Stop any simulated logging or resource updates that may have been initiated.
       stopSimulatedLogging(sessionId);
       stopSimulatedResourceUpdates(sessionId);
+      // Drop the payloads of resources created during this session.
+      releaseSessionResources(server);
       // Clean up task store timers
       taskStore.cleanup();
       if (initializeTimeout) clearTimeout(initializeTimeout);

@@ -4,6 +4,7 @@ import { CallToolResult, Resource } from "@modelcontextprotocol/sdk/types.js";
 import { gzipSync } from "node:zlib";
 import {
   getSessionResourceURI,
+  MAX_SESSION_RESOURCE_NAME_LENGTH,
   registerSessionResource,
 } from "../resources/session.js";
 
@@ -25,7 +26,11 @@ const GZIP_ALLOWED_DOMAINS = (process.env.GZIP_ALLOWED_DOMAINS ?? "")
 
 // Tool input schema
 const GZipFileAsResourceSchema = z.object({
-  name: z.string().describe("Name of the output file").default("README.md.gz"),
+  name: z
+    .string()
+    .max(MAX_SESSION_RESOURCE_NAME_LENGTH)
+    .describe("Name of the output file")
+    .default("README.md.gz"),
   data: z
     .url()
     .describe("URL or data URI of the file content to compress")
