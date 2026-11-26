@@ -33,7 +33,8 @@
 ### Module: `resources/session.ts`
 
 - `getSessionResourceURI(name: string)`: Builds a session resource URI: `demo://resource/session/<name>`.
-- `registerSessionResource(server, resource, type, payload)`: Registers a resource with the given `uri`, `name`, and `mimeType`, returning a `resource_link`. The content is served from memory for the life of the session only. Supports `type: "text" | "blob"` and returns data in the corresponding field.
+- `registerSessionResource(server, resource, type, payload)`: Registers a resource with the given `uri`, `name`, and `mimeType`, returning a `resource_link`. The content is served from memory for the life of the session only. Supports `type: "text" | "blob"` and returns data in the corresponding field. Names are limited to 256 characters, and all sessions combined may retain at most 8 MiB of payload across 1024 resources; registrations beyond those limits are rejected.
+- `releaseSessionResources(server)`: Called by `cleanup(sessionId?)` to remove every session resource registered on that session's server and release its payloads.
 - Intended usage: tools can create and expose per-session artifacts without persisting them. For example, `tools/gzip-file-as-resource.ts` compresses fetched content, registers it as a session resource with `mimeType: application/gzip`, and returns either a `resource_link` or an inline `resource` based on `outputType`.
 
 ## Simulated Logging
