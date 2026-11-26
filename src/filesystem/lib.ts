@@ -1,4 +1,5 @@
-import fs from "fs/promises";
+import fs, { type FileHandle } from "fs/promises";
+import { constants as fsConstants } from "fs";
 import path from "path";
 import os from 'os';
 import { randomBytes } from 'crypto';
@@ -184,6 +185,171 @@ export async function validatePath(requestedPath: string): Promise<string> {
 }
 
 
+// Directory-relative access
+//
+// validatePath returns a path string, and mkdir/rename/open on that string
+// walk it again at syscall time, following any parent directory that was
+// swapped for a symlink in between. Node has no openat/mkdirat/renameat, so on
+// Linux the `/proc/self/fd/<fd>/<name>` form stands in for them: the kernel
+// resolves `/proc/self/fd/<fd>` to the directory the descriptor already refers
+// to instead of re-walking a path, and only `<name>` is looked up in it.
+// Directories are opened one component at a time with O_NOFOLLOW from the
+// outermost allowed root, so every write acts on the directory that was
+// actually reached inside the allowed tree.
+const PROC_SELF_FD = '/proc/self/fd';
+const OPEN_DIRECTORY_FLAGS =
+  fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+const CREATE_EXCLUSIVE_FLAGS =
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+const OPEN_FILE_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+
+let directoryRelativeAccess: Promise<boolean> | undefined;
+
+function isDirectoryRelativeAccessAvailable(): Promise<boolean> {
+  directoryRelativeAccess ??= (async () => {
+    if (process.platform !== 'linux') {
+      return false;
+    }
+    let handle: FileHandle | undefined;
+    try {
+      handle = await fs.open(path.parse(process.cwd()).root, OPEN_DIRECTORY_FLAGS);
+      const [viaHandle, viaProc] = await Promise.all([
+        handle.stat(),
+        fs.stat(`${PROC_SELF_FD}/${handle.fd}`),
+      ]);
+      return viaHandle.dev === viaProc.dev && viaHandle.ino === viaProc.ino;
+    } catch {
+      return false;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  })();
+  return directoryRelativeAccess;
+}
+
+function entryPath(directory: FileHandle, name: string): string {
+  if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
+    throw new Error(`Invalid path component: ${name}`);
+  }
+  return `${PROC_SELF_FD}/${directory.fd}/${name}`;
+}
+
+function outermostAllowedRoot(targetPath: string): string {
+  const normalizedTarget = normalizePath(targetPath);
+  const containing = allowedDirectories
+    .filter(directory => isPathWithinAllowedDirectories(normalizedTarget, [directory]))
+    .sort((left, right) => left.length - right.length);
+  if (containing.length === 0) {
+    throw new Error(`Access denied - path outside allowed directories: ${targetPath} not in ${allowedDirectories.join(', ')}`);
+  }
+  return containing[0];
+}
+
+function describeWalkError(error: unknown, directoryPath: string): unknown {
+  const code = (error as NodeJS.ErrnoException).code;
+  // Linux reports a symlink opened with O_DIRECTORY | O_NOFOLLOW as ENOTDIR.
+  if (code === 'ELOOP' || code === 'ENOTDIR') {
+    return new Error(`Access denied - path component is a symbolic link or not a directory: ${directoryPath}`);
+  }
+  if (code === 'ENOENT') {
+    return new Error(`Parent directory does not exist: ${directoryPath}`);
+  }
+  return error;
+}
+
+// The outermost allowed root is opened by path: it is not inside any allowed
+// tree, so nothing the server lets a client write can replace it. Everything
+// below it is reached through the previous descriptor and never follows a
+// symlink.
+async function openDirectoryBeneathAllowedRoot(directoryPath: string, createMissing: boolean): Promise<FileHandle> {
+  const root = outermostAllowedRoot(directoryPath);
+  const relative = path.relative(root, directoryPath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Access denied - path outside allowed directories: ${directoryPath} not in ${allowedDirectories.join(', ')}`);
+  }
+
+  let current = await fs.open(root, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0));
+  try {
+    for (const part of relative.split(path.sep).filter(Boolean)) {
+      let next: FileHandle;
+      try {
+        next = await fs.open(entryPath(current, part), OPEN_DIRECTORY_FLAGS);
+      } catch (error) {
+        if (!createMissing || (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw describeWalkError(error, directoryPath);
+        }
+        try {
+          await fs.mkdir(entryPath(current, part));
+        } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== 'EEXIST') {
+            throw mkdirError;
+          }
+        }
+        try {
+          next = await fs.open(entryPath(current, part), OPEN_DIRECTORY_FLAGS);
+        } catch (reopenError) {
+          throw describeWalkError(reopenError, directoryPath);
+        }
+      }
+      await current.close();
+      current = next;
+    }
+    return current;
+  } catch (error) {
+    await current.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function withParentDirectory<T>(
+  targetPath: string,
+  action: (directory: FileHandle, name: string) => Promise<T>
+): Promise<T> {
+  const directory = await openDirectoryBeneathAllowedRoot(path.dirname(targetPath), false);
+  try {
+    return await action(directory, path.basename(targetPath));
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+}
+
+// Writes content to a fresh temporary file in the same directory and renames
+// it over `name`. The rename replaces a symlink at `name` instead of following
+// it, and the mode is applied through the temporary file's descriptor before
+// it becomes visible under `name`.
+async function replaceFileInDirectory(directory: FileHandle, name: string, content: string, mode: number): Promise<void> {
+  const tempPath = entryPath(directory, `${name}.${randomBytes(16).toString('hex')}.tmp`);
+  try {
+    const handle = await fs.open(tempPath, CREATE_EXCLUSIVE_FLAGS, 0o666);
+    try {
+      await handle.writeFile(content, 'utf-8');
+      // POSIX leaves the file-type bits unspecified for chmod, and a chmod
+      // failure must not fail a write whose content is already in place.
+      try {
+        await handle.chmod(mode & 0o777);
+      } catch {}
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(tempPath, entryPath(directory, name));
+  } catch (error) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {}
+    throw error;
+  }
+}
+
+export async function createDirectory(directoryPath: string): Promise<void> {
+  if (!(await isDirectoryRelativeAccessAvailable())) {
+    await fs.mkdir(directoryPath, { recursive: true });
+    return;
+  }
+  const directory = await openDirectoryBeneathAllowedRoot(directoryPath, true);
+  await directory.close();
+}
+
+
 // File Operations
 export async function getFileStats(filePath: string): Promise<FileInfo> {
   const stats = await fs.stat(filePath);
@@ -203,6 +369,28 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
 }
 
 export async function writeFileContent(filePath: string, content: string): Promise<void> {
+  if (await isDirectoryRelativeAccessAvailable()) {
+    await withParentDirectory(filePath, async (directory, name) => {
+      let handle: FileHandle;
+      try {
+        handle = await fs.open(entryPath(directory, name), CREATE_EXCLUSIVE_FLAGS, 0o666);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+          throw error;
+        }
+        const origStats = await fs.lstat(entryPath(directory, name));
+        await replaceFileInDirectory(directory, name, content, origStats.mode);
+        return;
+      }
+      try {
+        await handle.writeFile(content, 'utf-8');
+      } finally {
+        await handle.close();
+      }
+    });
+    return;
+  }
+
   try {
     // Security: 'wx' flag ensures exclusive creation - fails if file/symlink exists,
     // preventing writes through pre-existing symlinks
@@ -243,6 +431,25 @@ export async function moveFile(sourcePath: string, destinationPath: string): Pro
   // a data-loss bug, so reject up front when anything - file, directory, or
   // symlink - occupies the target. lstat is used so an existing symlink at the
   // destination is detected rather than followed.
+  if (await isDirectoryRelativeAccessAvailable()) {
+    await withParentDirectory(sourcePath, (sourceDirectory, sourceName) =>
+      withParentDirectory(destinationPath, async (destinationDirectory, destinationName) => {
+        const destinationEntry = entryPath(destinationDirectory, destinationName);
+        try {
+          await fs.lstat(destinationEntry);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            await fs.rename(entryPath(sourceDirectory, sourceName), destinationEntry);
+            return;
+          }
+          throw error;
+        }
+        throw new Error(`Destination already exists: ${destinationPath}`);
+      })
+    );
+    return;
+  }
+
   try {
     await fs.lstat(destinationPath);
   } catch (error) {
@@ -267,8 +474,65 @@ export async function applyFileEdits(
   edits: FileEdit[],
   dryRun: boolean = false
 ): Promise<string> {
-  // Read file content and normalize line endings
-  const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
+  if (await isDirectoryRelativeAccessAvailable()) {
+    return withParentDirectory(filePath, async (directory, name) => {
+      const handle = await fs.open(entryPath(directory, name), OPEN_FILE_FLAGS);
+      let original: string;
+      let mode: number;
+      try {
+        original = await handle.readFile('utf-8');
+        mode = (await handle.stat()).mode;
+      } finally {
+        await handle.close();
+      }
+      const { modifiedContent, formattedDiff } = computeFileEdits(original, edits, filePath);
+      if (!dryRun) {
+        await replaceFileInDirectory(directory, name, modifiedContent, mode);
+      }
+      return formattedDiff;
+    });
+  }
+
+  const { modifiedContent, formattedDiff } = computeFileEdits(
+    await fs.readFile(filePath, 'utf-8'),
+    edits,
+    filePath
+  );
+
+  if (!dryRun) {
+    // Security: Use atomic rename to prevent race conditions where symlinks
+    // could be created between validation and write. Rename operations
+    // replace the target file atomically and don't follow symlinks.
+    const origStats = await fs.stat(filePath);
+    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(tempPath, modifiedContent, 'utf-8');
+      await fs.rename(tempPath, filePath);
+    } catch (error) {
+      try {
+        await fs.unlink(tempPath);
+      } catch {}
+      throw error;
+    }
+    // Restore original permission bits since the atomic rename replaces the
+    // inode and the temp file has default (0644) permissions. Mask off the
+    // file-type bits; POSIX leaves them unspecified for chmod. A chmod
+    // failure must not fail the write, which has already succeeded.
+    try {
+      await fs.chmod(filePath, origStats.mode & 0o777);
+    } catch {}
+  }
+
+  return formattedDiff;
+}
+
+function computeFileEdits(
+  originalContent: string,
+  edits: FileEdit[],
+  filePath: string
+): { modifiedContent: string; formattedDiff: string } {
+  // Normalize line endings
+  const content = normalizeLineEndings(originalContent);
 
   // Apply edits sequentially
   let modifiedContent = content;
@@ -333,31 +597,7 @@ export async function applyFileEdits(
   }
   const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
 
-  if (!dryRun) {
-    // Security: Use atomic rename to prevent race conditions where symlinks
-    // could be created between validation and write. Rename operations
-    // replace the target file atomically and don't follow symlinks.
-    const origStats = await fs.stat(filePath);
-    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-    try {
-      await fs.writeFile(tempPath, modifiedContent, 'utf-8');
-      await fs.rename(tempPath, filePath);
-    } catch (error) {
-      try {
-        await fs.unlink(tempPath);
-      } catch {}
-      throw error;
-    }
-    // Restore original permission bits since the atomic rename replaces the
-    // inode and the temp file has default (0644) permissions. Mask off the
-    // file-type bits; POSIX leaves them unspecified for chmod. A chmod
-    // failure must not fail the write, which has already succeeded.
-    try {
-      await fs.chmod(filePath, origStats.mode & 0o777);
-    } catch {}
-  }
-
-  return formattedDiff;
+  return { modifiedContent, formattedDiff };
 }
 
 // Memory-efficient implementation to get the last N lines of a file

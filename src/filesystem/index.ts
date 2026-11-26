@@ -21,6 +21,7 @@ import {
   getFileStats,
   readFileContent,
   writeFileContent,
+  createDirectory,
   moveFile,
   searchFilesWithValidation,
   applyFileEdits,
@@ -427,7 +428,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof CreateDirectoryArgsSchema>) => {
     const validPath = await validatePath(args.path);
-    await fs.mkdir(validPath, { recursive: true });
+    await createDirectory(validPath);
     const text = `Successfully created directory ${args.path}`;
     return {
       content: [{ type: "text" as const, text }],
